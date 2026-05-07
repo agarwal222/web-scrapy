@@ -42,13 +42,12 @@ interface ScrapeAction {
   value?: string
 }
 
-// UPGRADED SCHEMA: Supports dual-selectors
 interface ScrapedNode {
   id: string
-  selector: string // The active selector
+  selector: string
   patternSelector: string
   exactSelector: string
-  count: number // The active count
+  count: number
   patternCount: number
   exactCount: number
   isExact: boolean
@@ -193,7 +192,7 @@ function App() {
           count: message.payload.patternCount,
           patternCount: message.payload.patternCount,
           exactCount: message.payload.exactCount,
-          isExact: false, // Default to pattern matching
+          isExact: false,
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
@@ -244,6 +243,37 @@ function App() {
     chrome.runtime.onMessage.addListener(handleMessage)
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
   }, [])
+
+  // --- NEW: REACT-DRIVEN DOM SYNCHRONIZATION ---
+  useEffect(() => {
+    const syncHighlights = async () => {
+      if (isScraping) return // Freeze visual updates during active run
+      try {
+        const [tab] = await chrome.tabs.query({
+          active: true,
+          lastFocusedWindow: true,
+        })
+        if (!tab?.id) return
+        chrome.tabs.sendMessage(tab.id, {
+          action: "SYNC_HIGHLIGHTS",
+          payload: {
+            schema: [...scrapedNodes, ...deepNodes],
+            containerSelector,
+            paginationSelector,
+          },
+        })
+      } catch (error) {
+        /* Ignore if content script disconnected */
+      }
+    }
+    syncHighlights()
+  }, [
+    scrapedNodes,
+    deepNodes,
+    containerSelector,
+    paginationSelector,
+    isScraping,
+  ])
 
   const saveSettings = (format: "csv" | "json") => {
     setExportFormat(format)
@@ -381,13 +411,6 @@ function App() {
     setIsDeepScrapeEnabled(false)
     setNavMode("none")
     setLiveData([])
-    chrome.tabs
-      .query({ active: true, lastFocusedWindow: true })
-      .then(
-        ([tab]) =>
-          tab?.id &&
-          chrome.tabs.sendMessage(tab.id, { action: "CLEAR_SELECTION" }),
-      )
   }
 
   const convertToCSV = (objArray: any[]) => {
@@ -696,7 +719,6 @@ function App() {
               <p className="text-[10px] text-muted-foreground font-mono">
                 {node.count} matches
               </p>
-              {/* NEW: STRICT EXACT MATCH TOGGLE */}
               <div className="flex items-center gap-1 opacity-60 hover:opacity-100 transition-opacity">
                 <input
                   type="checkbox"
@@ -1107,7 +1129,10 @@ function App() {
                 {Object.values(recipes).flat().length}
               </span>
             </Button>
-            {(scrapedNodes.length > 0 || deepNodes.length > 0) && (
+            {(scrapedNodes.length > 0 ||
+              deepNodes.length > 0 ||
+              containerSelector ||
+              paginationSelector) && (
               <Button
                 variant="ghost"
                 size="sm"

@@ -18,13 +18,9 @@ let currentSelectionMode:
   | "container"
   | "clickAction" = "column"
 let hoveredElement: HTMLElement | null = null
-let selectedElements: HTMLElement[] = []
-let paginationElement: HTMLElement | null = null
-let containerElements: HTMLElement[] = []
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// 1. Broad Pattern Matcher (Good for lists)
 const generateSelector = (el: HTMLElement): string => {
   if (el.id) return `#${el.id}`
   let selector = el.tagName.toLowerCase()
@@ -38,11 +34,9 @@ const generateSelector = (el: HTMLElement): string => {
   return selector
 }
 
-// 2. Strict Exact Matcher (Good for unique profile elements)
 const getExactSelector = (el: HTMLElement): string => {
   const path: string[] = []
   let current: HTMLElement | null = el
-
   while (current && current.nodeType === Node.ELEMENT_NODE) {
     let selector = current.tagName.toLowerCase()
     if (selector === "html") {
@@ -128,19 +122,19 @@ const handleClick = (e: MouseEvent) => {
 
   if (hoveredElement) {
     if (currentSelectionMode === "column") {
-      // Calculate both selectors simultaneously
       const patternSelector = generateSelector(hoveredElement)
       const exactSelector = getExactSelector(hoveredElement)
 
-      const patternMatches = document.querySelectorAll(patternSelector).length
-      const exactMatches = document.querySelectorAll(exactSelector).length
+      let patternMatches = 0
+      let exactMatches = 0
+      try {
+        patternMatches = document.querySelectorAll(patternSelector).length
+      } catch (e) {}
+      try {
+        exactMatches = document.querySelectorAll(exactSelector).length
+      } catch (e) {}
 
-      const matches = Array.from(
-        document.querySelectorAll(patternSelector),
-      ) as HTMLElement[]
-      matches.forEach((el) => el.classList.add("web-scrapy-selected"))
-      selectedElements.push(...matches)
-
+      // Notice we do NOT apply highlights here anymore. React will handle it via SYNC_HIGHLIGHTS.
       chrome.runtime.sendMessage({
         action: "ELEMENTS_SELECTED",
         payload: {
@@ -152,35 +146,22 @@ const handleClick = (e: MouseEvent) => {
         },
       })
     } else {
-      // Standard flow for actions, containers, pagination
       const selector = generateSelector(hoveredElement)
       if (currentSelectionMode === "clickAction") {
-        hoveredElement.classList.add("web-scrapy-action-selected")
-        selectedElements.push(hoveredElement)
         chrome.runtime.sendMessage({
           action: "ACTION_SELECTED",
           payload: { selector },
         })
       } else if (currentSelectionMode === "container") {
-        containerElements.forEach((el) =>
-          el.classList.remove("web-scrapy-container-selected"),
-        )
-        const matches = Array.from(
-          document.querySelectorAll(selector),
-        ) as HTMLElement[]
-        matches.forEach((el) =>
-          el.classList.add("web-scrapy-container-selected"),
-        )
-        containerElements = matches
+        let count = 0
+        try {
+          count = document.querySelectorAll(selector).length
+        } catch (e) {}
         chrome.runtime.sendMessage({
           action: "CONTAINER_SELECTED",
-          payload: { selector, count: matches.length },
+          payload: { selector, count },
         })
       } else if (currentSelectionMode === "pagination") {
-        if (paginationElement)
-          paginationElement.classList.remove("web-scrapy-pagination-selected")
-        hoveredElement.classList.add("web-scrapy-pagination-selected")
-        paginationElement = hoveredElement
         chrome.runtime.sendMessage({
           action: "PAGINATION_SELECTED",
           payload: { selector },
@@ -191,21 +172,19 @@ const handleClick = (e: MouseEvent) => {
   }
 }
 
-const clearHighlights = () => {
-  if (hoveredElement) hoveredElement.classList.remove("web-scrapy-hover")
-  selectedElements.forEach((el) => {
-    el.classList.remove("web-scrapy-selected")
-    el.classList.remove("web-scrapy-action-selected")
-  })
-  containerElements.forEach((el) =>
-    el.classList.remove("web-scrapy-container-selected"),
-  )
-  if (paginationElement)
-    paginationElement.classList.remove("web-scrapy-pagination-selected")
-  selectedElements = []
-  containerElements = []
-  hoveredElement = null
-  paginationElement = null
+const clearAllHighlights = () => {
+  document
+    .querySelectorAll(".web-scrapy-selected")
+    .forEach((el) => el.classList.remove("web-scrapy-selected"))
+  document
+    .querySelectorAll(".web-scrapy-action-selected")
+    .forEach((el) => el.classList.remove("web-scrapy-action-selected"))
+  document
+    .querySelectorAll(".web-scrapy-container-selected")
+    .forEach((el) => el.classList.remove("web-scrapy-container-selected"))
+  document
+    .querySelectorAll(".web-scrapy-pagination-selected")
+    .forEach((el) => el.classList.remove("web-scrapy-pagination-selected"))
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -220,10 +199,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "CLEAR_SELECTION") {
-    clearHighlights()
+    clearAllHighlights()
     sendResponse({ status: "success" })
   }
 
+  // --- NEW: THE SYNC ENGINE ---
+  if (request.action === "SYNC_HIGHLIGHTS") {
+    clearAllHighlights() // Wipe the slate clean
+    const { schema, containerSelector, paginationSelector } = request.payload
+
+    try {
+      if (containerSelector)
+        document
+          .querySelectorAll(containerSelector)
+          .forEach((el) => el.classList.add("web-scrapy-container-selected"))
+      if (paginationSelector) {
+        const el = document.querySelector(paginationSelector)
+        if (el) el.classList.add("web-scrapy-pagination-selected")
+      }
+      schema.forEach((col: any) => {
+        if (col.selector)
+          document
+            .querySelectorAll(col.selector)
+            .forEach((el) => el.classList.add("web-scrapy-selected"))
+        if (col.actions) {
+          col.actions.forEach((act: any) => {
+            if (act.selector)
+              document
+                .querySelectorAll(act.selector)
+                .forEach((el) => el.classList.add("web-scrapy-action-selected"))
+          })
+        }
+      })
+    } catch (e) {
+      console.warn("Invalid selector detected during sync.")
+    }
+    sendResponse({ status: "success" })
+  }
+
+  // UI Blockers & Executions remain unchanged
   if (request.action === "BLOCK_UI") {
     if (!document.getElementById("web-scrapy-glass-shield")) {
       const shield = document.createElement("div")
@@ -255,10 +269,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const containers = Array.from(
             document.querySelectorAll(containerSelector),
           )
-
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
-
             for (const col of schema) {
               if (col.actions && col.actions.length > 0) {
                 for (const action of col.actions) {
@@ -288,7 +300,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
               }
             }
-
             for (const col of schema) {
               const el = container.querySelector(col.selector) as HTMLElement
               let val = ""
@@ -329,7 +340,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               }
             }
           }
-
           if (schema.some((c: any) => c.actions && c.actions.length > 0))
             await sleep(800)
 
@@ -358,7 +368,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             scrapedData.push(rowObj)
           }
         }
-
         sendResponse({ status: "success", data: scrapedData })
       } catch (error) {
         sendResponse({ status: "error", message: String(error) })
@@ -386,6 +395,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ status: "error", message: "Not found" })
     }
   }
-
   return true
 })
