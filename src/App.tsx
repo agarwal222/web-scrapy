@@ -1,4 +1,5 @@
 import {
+  Activity,
   ArrowDownToLine,
   ArrowRightToLine,
   Ban,
@@ -17,6 +18,7 @@ import {
   Save,
   Settings,
   Square,
+  TableProperties,
   Trash2,
   Upload,
   X,
@@ -33,7 +35,6 @@ import {
   SelectValue,
 } from "./components/ui/select"
 
-// --- NEW DATA STRUCTURES ---
 interface ScrapeAction {
   id: string
   type: "click" | "wait" | "type"
@@ -48,7 +49,7 @@ interface ScrapedNode {
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
-  actions?: ScrapeAction[] // Replaced clickSelector with robust array
+  actions?: ScrapeAction[]
 }
 
 type NavMode = "none" | "next" | "loadMore" | "infinite"
@@ -108,7 +109,6 @@ function App() {
   >("column")
 
   const targetSchemaRef = useRef<"surface" | "deep">("surface")
-  // Holds both ColID and ActionID to route DOM selectors properly
   const activeActionTargetRef = useRef<{
     colId: string
     actionId: string
@@ -116,6 +116,9 @@ function App() {
 
   const [isScraping, setIsScraping] = useState(false)
   const [statusText, setStatusText] = useState("")
+
+  // NEW: Live Data State for Console
+  const [liveData, setLiveData] = useState<any[]>([])
 
   const [scrapedNodes, setScrapedNodes] = useState<ScrapedNode[]>([])
   const [containerSelector, setContainerSelector] = useState<string | null>(
@@ -370,6 +373,7 @@ function App() {
     setContainerSelector(null)
     setIsDeepScrapeEnabled(false)
     setNavMode("none")
+    setLiveData([])
     chrome.tabs
       .query({ active: true, lastFocusedWindow: true })
       .then(
@@ -397,7 +401,8 @@ function App() {
     abortController.current = false
     setIsScraping(true)
     setSuggestedRecipe(null)
-    let allData: any[] = []
+    setLiveData([])
+    let currentDataState: any[] = []
     let currentPage = 1
     const keepScraping = true
     let workerWindowId: number | null = null
@@ -410,7 +415,7 @@ function App() {
       const startUrl = initTab?.url
       if (!startUrl) throw new Error("No active URL found to start scraping.")
 
-      setStatusText("Spawning isolated worker window...")
+      setStatusText("Spawning isolated worker...")
       const workerWindow = await chrome.windows.create({
         url: startUrl,
         type: "popup",
@@ -430,7 +435,7 @@ function App() {
           setStatusText("Aborted.")
           break
         }
-        setStatusText(`Scrolling Surface Page ${currentPage}...`)
+        setStatusText(`Extracting Surface Data (Page ${currentPage})...`)
         await new Promise((resolve) =>
           chrome.tabs.sendMessage(
             workerTabId,
@@ -440,7 +445,6 @@ function App() {
         )
         await randomSleep(800, 1500)
 
-        setStatusText(`Extracting Surface Data ${currentPage}...`)
         const scrapeRes: any = await new Promise((resolve) =>
           chrome.tabs.sendMessage(
             workerTabId,
@@ -451,9 +455,12 @@ function App() {
             resolve,
           ),
         )
-        if (scrapeRes?.status === "success" && scrapeRes.data)
-          allData = [...allData, ...scrapeRes.data]
-        else break
+        if (scrapeRes?.status === "success" && scrapeRes.data) {
+          currentDataState = [...currentDataState, ...scrapeRes.data]
+          setLiveData([...currentDataState]) // UPDATE LIVE CONSOLE
+        } else {
+          break
+        }
 
         if (
           abortController.current ||
@@ -463,7 +470,7 @@ function App() {
           break
 
         if (navMode === "infinite") {
-          setStatusText(`Loading more via Scroll...`)
+          setStatusText(`Scrolling down...`)
           await randomSleep(3000, 5000)
           currentPage++
         } else if (navMode === "loadMore") {
@@ -484,7 +491,7 @@ function App() {
           currentPage++
         } else if (navMode === "next") {
           if (!paginationSelector) break
-          setStatusText(`Navigating to next page...`)
+          setStatusText(`Navigating to page ${currentPage + 1}...`)
           const clickRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
@@ -503,9 +510,10 @@ function App() {
       }
 
       setStatusText(`Deduplicating rows...`)
-      allData = Array.from(new Set(allData.map((a) => JSON.stringify(a)))).map(
-        (a) => JSON.parse(a),
-      )
+      currentDataState = Array.from(
+        new Set(currentDataState.map((a) => JSON.stringify(a))),
+      ).map((a) => JSON.parse(a))
+      setLiveData([...currentDataState])
 
       if (
         !abortController.current &&
@@ -513,27 +521,27 @@ function App() {
         deepLinkColumn &&
         deepNodes.length > 0
       ) {
-        for (let i = 0; i < allData.length; i++) {
+        for (let i = 0; i < currentDataState.length; i++) {
           if (abortController.current) {
             setStatusText("Deep Scrape Aborted.")
             break
           }
-          const targetUrl = allData[i][deepLinkColumn]
+          const targetUrl = currentDataState[i][deepLinkColumn]
           if (
             !targetUrl ||
             typeof targetUrl !== "string" ||
             !targetUrl.startsWith("http")
           ) {
-            allData[i]["_deep_scrape_status"] = "Invalid URL"
+            currentDataState[i]["_deep_scrape_status"] = "Invalid URL"
             continue
           }
 
           setStatusText(
-            `Deep Scraping Profile ${i + 1} of ${allData.length}...`,
+            `Deep Scraping Profile ${i + 1} of ${currentDataState.length}...`,
           )
           const loadSuccess = await navigateAndWait(workerTabId, targetUrl)
           if (!loadSuccess) {
-            allData[i]["_deep_scrape_status"] = "Timeout"
+            currentDataState[i]["_deep_scrape_status"] = "Timeout"
             continue
           }
 
@@ -548,25 +556,27 @@ function App() {
             deepRes?.status === "success" &&
             deepRes.data &&
             deepRes.data.length > 0
-          )
-            allData[i] = { ...allData[i], ...deepRes.data[0] }
-          else allData[i]["_deep_scrape_status"] = "Failed Extraction"
-
+          ) {
+            currentDataState[i] = { ...currentDataState[i], ...deepRes.data[0] }
+            setLiveData([...currentDataState]) // UPDATE LIVE CONSOLE
+          } else {
+            currentDataState[i]["_deep_scrape_status"] = "Failed Extraction"
+          }
           await randomSleep(2000, 4000)
         }
       }
 
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
-      if (allData.length > 0) {
+      if (currentDataState.length > 0) {
         let blob: Blob
         let filename: string
         if (exportFormat === "csv") {
-          blob = new Blob([convertToCSV(allData)], {
+          blob = new Blob([convertToCSV(currentDataState)], {
             type: "text/csv;charset=utf-8;",
           })
           filename = `scrapy_export_${Date.now()}.csv`
         } else {
-          blob = new Blob([JSON.stringify(allData, null, 2)], {
+          blob = new Blob([JSON.stringify(currentDataState, null, 2)], {
             type: "application/json;charset=utf-8;",
           })
           filename = `scrapy_export_${Date.now()}.json`
@@ -590,7 +600,6 @@ function App() {
     }
   }
 
-  // --- ACTION BUILDER HELPERS ---
   const addAction = (
     nodeId: string,
     type: "click" | "wait" | "type",
@@ -610,7 +619,6 @@ function App() {
       ),
     )
   }
-
   const updateAction = (
     nodeId: string,
     actionId: string,
@@ -632,7 +640,6 @@ function App() {
       ),
     )
   }
-
   const removeAction = (
     nodeId: string,
     actionId: string,
@@ -736,7 +743,6 @@ function App() {
           </p>
         </div>
 
-        {/* --- ACTION BUILDER UI --- */}
         <div className="pt-2 border-t border-border/50 space-y-2">
           <div className="flex items-center justify-between">
             <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -781,7 +787,6 @@ function App() {
               const isThisActionSelecting =
                 isNodeActionSelecting &&
                 activeActionTargetRef.current?.actionId === action.id
-
               return (
                 <div
                   key={action.id}
@@ -795,7 +800,6 @@ function App() {
                   >
                     <X className="w-3 h-3" />
                   </Button>
-
                   <div className="flex items-center gap-1.5">
                     {action.type === "click" && (
                       <MousePointerClick className="w-3 h-3 text-rose-500" />
@@ -810,7 +814,6 @@ function App() {
                       {action.type}
                     </span>
                   </div>
-
                   {action.type === "wait" ? (
                     <div className="flex items-center gap-2 mt-1">
                       <Input
@@ -897,6 +900,15 @@ function App() {
         </div>
       </div>
     )
+  }
+
+  // Helper to derive table headers dynamically from current schema state
+  const getTableHeaders = () => {
+    const surfaceHeaders = scrapedNodes.map((n) => n.columnName)
+    const deepHeaders = isDeepScrapeEnabled
+      ? deepNodes.map((n) => n.columnName)
+      : []
+    return [...surfaceHeaders, ...deepHeaders]
   }
 
   return (
@@ -1071,298 +1083,374 @@ function App() {
         )}
       </header>
 
-      <main className="flex-1 overflow-y-auto p-4 space-y-8 custom-scrollbar">
-        {suggestedRecipe && !isScraping && (
-          <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-2 text-primary">
-              <Bookmark className="w-4 h-4" />{" "}
-              <span className="text-xs font-medium">
-                Found template: {suggestedRecipe.name}
+      {/* CONDITIONAL RENDER: SCHEMA BUILDER vs LIVE CONSOLE */}
+      {isScraping ? (
+        <main className="flex-1 flex flex-col overflow-hidden bg-background">
+          <div className="p-4 border-b border-border/40 flex items-center justify-between bg-secondary/5">
+            <div className="flex items-center gap-3">
+              <Activity className="w-4 h-4 text-primary animate-pulse" />
+              <span className="text-xs font-semibold text-primary">
+                {statusText}
               </span>
             </div>
-            <div className="flex gap-1">
-              <Button
-                size="icon"
-                variant="ghost"
-                className="h-6 w-6 text-primary hover:bg-primary/20"
-                onClick={() => setSuggestedRecipe(null)}
-              >
-                <X className="w-3 h-3" />
-              </Button>
-              <Button
-                size="sm"
-                className="h-6 text-[10px] px-2 bg-primary text-primary-foreground"
-                onClick={() => loadRecipe(suggestedRecipe)}
-              >
-                Load
-              </Button>
+            <div className="flex items-center gap-1.5 bg-background border border-border/50 px-2.5 py-1 rounded-md">
+              <TableProperties className="w-3.5 h-3.5 text-muted-foreground" />
+              <span className="text-xs font-mono text-muted-foreground">
+                {liveData.length} Rows
+              </span>
             </div>
           </div>
-        )}
 
-        <section className="space-y-4 pb-4 border-b border-border/40">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold tracking-wide text-foreground">
-              Surface Data (List Page)
-            </h2>
-          </div>
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">
-              Row Container
-            </Label>
-            <Button
-              onClick={() => toggleScraper("container", "surface")}
-              disabled={isScraping}
-              variant="outline"
-              className={`w-full justify-start h-auto py-2 px-3 border-dashed ${containerSelector ? "border-solid bg-secondary/20" : ""}`}
-            >
-              <div className="flex items-center gap-3 w-full">
-                {containerSelector ? (
-                  <Check className="w-4 h-4 text-primary" />
-                ) : (
-                  <MousePointer2 className="w-4 h-4 text-muted-foreground" />
-                )}
-                <div className="flex flex-col items-start flex-1">
-                  <span className="text-xs">
-                    {containerSelector
-                      ? "Container Locked"
-                      : "Select List Item Container"}
-                  </span>
-                  {containerSelector && (
-                    <span className="text-[10px] text-muted-foreground font-mono">
-                      {containerCount} rows detected
-                    </span>
-                  )}
-                </div>
-              </div>
-            </Button>
-          </div>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label className="text-xs text-muted-foreground">Columns</Label>
-              <Button
-                onClick={() => toggleScraper("column", "surface")}
-                disabled={isScraping}
-                variant="ghost"
-                size="sm"
-                className="h-6 text-[10px]"
-              >
-                + Add Column
-              </Button>
-            </div>
-            <div className="space-y-3">
-              {scrapedNodes.length === 0 && (
-                <div className="text-center py-4 border border-dashed border-border/40 rounded-lg text-muted-foreground text-xs">
-                  No columns defined.
-                </div>
-              )}
-              {scrapedNodes.map((node) => renderNodeControls(node, "surface"))}
-            </div>
-          </div>
-        </section>
-
-        <section className="space-y-4 pb-4 border-b border-border/40">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Layers
-                className={`w-4 h-4 ${isDeepScrapeEnabled ? "text-indigo-400" : "text-muted-foreground"}`}
-              />
-              <h2
-                className={`text-sm font-semibold tracking-wide ${isDeepScrapeEnabled ? "text-indigo-400" : "text-foreground"}`}
-              >
-                Deep Scrape (Profiles)
-              </h2>
-            </div>
-            <div className="flex items-center space-x-2">
-              <Label className="text-[10px] uppercase text-muted-foreground">
-                Enable
-              </Label>
-              <input
-                type="checkbox"
-                checked={isDeepScrapeEnabled}
-                onChange={(e) => setIsDeepScrapeEnabled(e.target.checked)}
-                className="accent-indigo-500 w-4 h-4"
-              />
-            </div>
-          </div>
-          {isDeepScrapeEnabled && (
-            <div className="p-4 bg-indigo-950/10 border border-indigo-900/30 rounded-xl space-y-4 animate-in fade-in slide-in-from-top-2">
-              <div className="space-y-1.5">
-                <Label className="text-xs text-indigo-300 flex items-center gap-1.5">
-                  <Link2 className="w-3 h-3" /> Target URL Source
-                </Label>
-                <p className="text-[10px] text-muted-foreground leading-tight">
-                  Select which column from the Surface data contains the link to
-                  the profile page.
+          <div className="flex-1 overflow-auto custom-scrollbar p-4">
+            {liveData.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-3 opacity-50">
+                <Activity className="w-8 h-8 animate-pulse" />
+                <p className="text-xs font-medium">
+                  Awaiting first payload from worker...
                 </p>
-                <Select
-                  disabled={isScraping}
-                  value={deepLinkColumn}
-                  onValueChange={setDeepLinkColumn}
-                >
-                  <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50">
-                    <SelectValue placeholder="Select URL Column..." />
-                  </SelectTrigger>
-                  <SelectContent className="border-border">
-                    {scrapedNodes.map((n) => (
-                      <SelectItem
-                        key={n.id}
-                        value={n.columnName}
-                        className="text-xs"
-                      >
-                        {n.columnName} (Attribute: {n.attribute})
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
               </div>
-              <div className="space-y-2 pt-2 border-t border-indigo-900/20">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs text-indigo-300">
-                    Deep Data Extractors
-                  </Label>
-                  <Button
-                    onClick={() => toggleScraper("column", "deep")}
-                    disabled={isScraping}
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 text-[10px] text-indigo-400 hover:text-indigo-300"
-                  >
-                    + Add Detail Column
-                  </Button>
+            ) : (
+              <div className="border border-border/40 rounded-lg overflow-hidden bg-background shadow-sm">
+                <div className="overflow-x-auto custom-scrollbar">
+                  <table className="w-full text-left text-xs whitespace-nowrap">
+                    <thead className="bg-secondary/20 border-b border-border/40">
+                      <tr>
+                        <th className="px-3 py-2 font-medium text-muted-foreground w-12 border-r border-border/20">
+                          #
+                        </th>
+                        {getTableHeaders().map((h, i) => (
+                          <th
+                            key={i}
+                            className="px-3 py-2 font-medium text-muted-foreground border-r border-border/20 last:border-0"
+                          >
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {liveData.map((row, idx) => (
+                        <tr
+                          key={idx}
+                          className="border-b border-border/20 last:border-0 hover:bg-secondary/10 transition-colors"
+                        >
+                          <td className="px-3 py-2 text-muted-foreground font-mono border-r border-border/20">
+                            {idx + 1}
+                          </td>
+                          {getTableHeaders().map((h, i) => (
+                            <td
+                              key={i}
+                              className="px-3 py-2 max-w-[200px] truncate border-r border-border/20 last:border-0"
+                              title={row[h]}
+                            >
+                              {row[h] || (
+                                <span className="text-muted-foreground/30">
+                                  -
+                                </span>
+                              )}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-                <div className="space-y-3">
-                  {deepNodes.length === 0 && (
-                    <div className="text-center py-4 border border-dashed border-indigo-900/40 rounded-lg text-indigo-400/50 text-[10px]">
-                      Navigate to a profile page, then define deep columns here.
-                    </div>
-                  )}
-                  {deepNodes.map((node) => renderNodeControls(node, "deep"))}
-                </div>
+              </div>
+            )}
+          </div>
+        </main>
+      ) : (
+        <main className="flex-1 overflow-y-auto p-4 space-y-8 custom-scrollbar">
+          {suggestedRecipe && (
+            <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2 text-primary">
+                <Bookmark className="w-4 h-4" />{" "}
+                <span className="text-xs font-medium">
+                  Found template: {suggestedRecipe.name}
+                </span>
+              </div>
+              <div className="flex gap-1">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-6 w-6 text-primary hover:bg-primary/20"
+                  onClick={() => setSuggestedRecipe(null)}
+                >
+                  <X className="w-3 h-3" />
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-6 text-[10px] px-2 bg-primary text-primary-foreground"
+                  onClick={() => loadRecipe(suggestedRecipe)}
+                >
+                  Load
+                </Button>
               </div>
             </div>
           )}
-        </section>
 
-        <section className="space-y-3">
-          <div className="flex items-center justify-between text-muted-foreground">
-            <h2 className="text-sm font-semibold tracking-wide text-foreground">
-              Navigation & Pagination
-            </h2>
-          </div>
-          <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-4">
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Mode</Label>
-              <Select
-                disabled={isScraping}
-                value={navMode}
-                onValueChange={(val: NavMode) => setNavMode(val)}
-              >
-                <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50 shadow-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-border">
-                  <SelectItem
-                    value="none"
-                    className="text-xs flex items-center gap-2"
-                  >
-                    <Ban className="w-3 h-3 inline mr-1" /> Single Page Only
-                  </SelectItem>
-                  <SelectItem
-                    value="next"
-                    className="text-xs flex items-center gap-2"
-                  >
-                    <ArrowRightToLine className="w-3 h-3 inline mr-1" /> Click
-                    'Next Page'
-                  </SelectItem>
-                  <SelectItem
-                    value="loadMore"
-                    className="text-xs flex items-center gap-2"
-                  >
-                    <MousePointerClick className="w-3 h-3 inline mr-1" /> Click
-                    'Load More'
-                  </SelectItem>
-                  <SelectItem
-                    value="infinite"
-                    className="text-xs flex items-center gap-2"
-                  >
-                    <ArrowDownToLine className="w-3 h-3 inline mr-1" /> Infinite
-                    Scroll
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+          <section className="space-y-4 pb-4 border-b border-border/40">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold tracking-wide text-foreground">
+                Surface Data (List Page)
+              </h2>
             </div>
-            {(navMode === "next" || navMode === "loadMore") && (
-              <div className="space-y-1.5 pt-2 border-t border-border/30">
-                <Label className="text-xs text-muted-foreground">
-                  Target Button
-                </Label>
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">
+                Row Container
+              </Label>
+              <Button
+                onClick={() => toggleScraper("container", "surface")}
+                disabled={isScraping}
+                variant="outline"
+                className={`w-full justify-start h-auto py-2 px-3 border-dashed ${containerSelector ? "border-solid bg-secondary/20" : ""}`}
+              >
+                <div className="flex items-center gap-3 w-full">
+                  {containerSelector ? (
+                    <Check className="w-4 h-4 text-primary" />
+                  ) : (
+                    <MousePointer2 className="w-4 h-4 text-muted-foreground" />
+                  )}
+                  <div className="flex flex-col items-start flex-1">
+                    <span className="text-xs">
+                      {containerSelector
+                        ? "Container Locked"
+                        : "Select List Item Container"}
+                    </span>
+                    {containerSelector && (
+                      <span className="text-[10px] text-muted-foreground font-mono">
+                        {containerCount} rows detected
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </Button>
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs text-muted-foreground">Columns</Label>
                 <Button
-                  onClick={() => toggleScraper("pagination")}
+                  onClick={() => toggleScraper("column", "surface")}
                   disabled={isScraping}
-                  variant="outline"
+                  variant="ghost"
                   size="sm"
-                  className={`w-full text-xs h-8 border-dashed ${paginationSelector ? "border-solid bg-background" : ""}`}
+                  className="h-6 text-[10px]"
                 >
-                  {paginationSelector
-                    ? "Target Locked"
-                    : "+ Select Button on Page"}
+                  + Add Column
                 </Button>
               </div>
-            )}
-            {navMode !== "none" && (
-              <div className="space-y-2 pt-2 border-t border-border/30">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs text-muted-foreground">
-                    Scrape Limit
+              <div className="space-y-3">
+                {scrapedNodes.length === 0 && (
+                  <div className="text-center py-4 border border-dashed border-border/40 rounded-lg text-muted-foreground text-xs">
+                    No columns defined.
+                  </div>
+                )}
+                {scrapedNodes.map((node) =>
+                  renderNodeControls(node, "surface"),
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section className="space-y-4 pb-4 border-b border-border/40">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Layers
+                  className={`w-4 h-4 ${isDeepScrapeEnabled ? "text-indigo-400" : "text-muted-foreground"}`}
+                />
+                <h2
+                  className={`text-sm font-semibold tracking-wide ${isDeepScrapeEnabled ? "text-indigo-400" : "text-foreground"}`}
+                >
+                  Deep Scrape (Profiles)
+                </h2>
+              </div>
+              <div className="flex items-center space-x-2">
+                <Label className="text-[10px] uppercase text-muted-foreground">
+                  Enable
+                </Label>
+                <input
+                  type="checkbox"
+                  checked={isDeepScrapeEnabled}
+                  onChange={(e) => setIsDeepScrapeEnabled(e.target.checked)}
+                  className="accent-indigo-500 w-4 h-4"
+                />
+              </div>
+            </div>
+            {isDeepScrapeEnabled && (
+              <div className="p-4 bg-indigo-950/10 border border-indigo-900/30 rounded-xl space-y-4 animate-in fade-in slide-in-from-top-2">
+                <div className="space-y-1.5">
+                  <Label className="text-xs text-indigo-300 flex items-center gap-1.5">
+                    <Link2 className="w-3 h-3" /> Target URL Source
                   </Label>
+                  <p className="text-[10px] text-muted-foreground leading-tight">
+                    Select which column from the Surface data contains the link
+                    to the profile page.
+                  </p>
                   <Select
                     disabled={isScraping}
-                    value={pageLimitMode}
-                    onValueChange={(val: "all" | "custom") =>
-                      setPageLimitMode(val)
-                    }
+                    value={deepLinkColumn}
+                    onValueChange={setDeepLinkColumn}
                   >
-                    <SelectTrigger className="w-[110px] h-7 text-xs bg-background shadow-sm">
-                      <SelectValue />
+                    <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50">
+                      <SelectValue placeholder="Select URL Column..." />
                     </SelectTrigger>
                     <SelectContent className="border-border">
-                      <SelectItem value="custom" className="text-xs">
-                        Custom Limit
-                      </SelectItem>
-                      <SelectItem value="all" className="text-xs">
-                        Exhaust Site
-                      </SelectItem>
+                      {scrapedNodes.map((n) => (
+                        <SelectItem
+                          key={n.id}
+                          value={n.columnName}
+                          className="text-xs"
+                        >
+                          {n.columnName} (Attribute: {n.attribute})
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </div>
-                {pageLimitMode === "custom" && (
-                  <div className="flex items-center justify-between pt-1">
-                    <span className="text-xs text-muted-foreground">
-                      Max passes
-                    </span>
-                    <Input
+                <div className="space-y-2 pt-2 border-t border-indigo-900/20">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs text-indigo-300">
+                      Deep Data Extractors
+                    </Label>
+                    <Button
+                      onClick={() => toggleScraper("column", "deep")}
                       disabled={isScraping}
-                      type="number"
-                      value={maxPages}
-                      onChange={(e) => setMaxPages(Number(e.target.value))}
-                      className="w-16 h-7 text-xs bg-background text-center px-1"
-                      min={1}
-                    />
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 text-[10px] text-indigo-400 hover:text-indigo-300"
+                    >
+                      + Add Detail Column
+                    </Button>
                   </div>
-                )}
+                  <div className="space-y-3">
+                    {deepNodes.length === 0 && (
+                      <div className="text-center py-4 border border-dashed border-indigo-900/40 rounded-lg text-indigo-400/50 text-[10px]">
+                        Navigate to a profile page, then define deep columns
+                        here.
+                      </div>
+                    )}
+                    {deepNodes.map((node) => renderNodeControls(node, "deep"))}
+                  </div>
+                </div>
               </div>
             )}
-          </div>
-        </section>
-      </main>
+          </section>
+
+          <section className="space-y-3">
+            <div className="flex items-center justify-between text-muted-foreground">
+              <h2 className="text-sm font-semibold tracking-wide text-foreground">
+                Navigation & Pagination
+              </h2>
+            </div>
+            <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-4">
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">Mode</Label>
+                <Select
+                  disabled={isScraping}
+                  value={navMode}
+                  onValueChange={(val: NavMode) => setNavMode(val)}
+                >
+                  <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50 shadow-sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="border-border">
+                    <SelectItem
+                      value="none"
+                      className="text-xs flex items-center gap-2"
+                    >
+                      <Ban className="w-3 h-3 inline mr-1" /> Single Page Only
+                    </SelectItem>
+                    <SelectItem
+                      value="next"
+                      className="text-xs flex items-center gap-2"
+                    >
+                      <ArrowRightToLine className="w-3 h-3 inline mr-1" /> Click
+                      'Next Page'
+                    </SelectItem>
+                    <SelectItem
+                      value="loadMore"
+                      className="text-xs flex items-center gap-2"
+                    >
+                      <MousePointerClick className="w-3 h-3 inline mr-1" />{" "}
+                      Click 'Load More'
+                    </SelectItem>
+                    <SelectItem
+                      value="infinite"
+                      className="text-xs flex items-center gap-2"
+                    >
+                      <ArrowDownToLine className="w-3 h-3 inline mr-1" />{" "}
+                      Infinite Scroll
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {(navMode === "next" || navMode === "loadMore") && (
+                <div className="space-y-1.5 pt-2 border-t border-border/30">
+                  <Label className="text-xs text-muted-foreground">
+                    Target Button
+                  </Label>
+                  <Button
+                    onClick={() => toggleScraper("pagination")}
+                    disabled={isScraping}
+                    variant="outline"
+                    size="sm"
+                    className={`w-full text-xs h-8 border-dashed ${paginationSelector ? "border-solid bg-background" : ""}`}
+                  >
+                    {paginationSelector
+                      ? "Target Locked"
+                      : "+ Select Button on Page"}
+                  </Button>
+                </div>
+              )}
+              {navMode !== "none" && (
+                <div className="space-y-2 pt-2 border-t border-border/30">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs text-muted-foreground">
+                      Scrape Limit
+                    </Label>
+                    <Select
+                      disabled={isScraping}
+                      value={pageLimitMode}
+                      onValueChange={(val: "all" | "custom") =>
+                        setPageLimitMode(val)
+                      }
+                    >
+                      <SelectTrigger className="w-[110px] h-7 text-xs bg-background shadow-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="border-border">
+                        <SelectItem value="custom" className="text-xs">
+                          Custom Limit
+                        </SelectItem>
+                        <SelectItem value="all" className="text-xs">
+                          Exhaust Site
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {pageLimitMode === "custom" && (
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="text-xs text-muted-foreground">
+                        Max passes
+                      </span>
+                      <Input
+                        disabled={isScraping}
+                        type="number"
+                        value={maxPages}
+                        onChange={(e) => setMaxPages(Number(e.target.value))}
+                        className="w-16 h-7 text-xs bg-background text-center px-1"
+                        min={1}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+        </main>
+      )}
 
       <footer className="px-4 py-4 border-t border-border/40 shrink-0 bg-background/95 backdrop-blur z-10 space-y-3">
-        {statusText && (
-          <p className="text-[10px] uppercase tracking-wider text-primary text-center font-bold animate-pulse">
-            {statusText}
-          </p>
-        )}
         {isScraping ? (
           <Button
             onClick={() => {
@@ -1371,7 +1459,7 @@ function App() {
             variant="destructive"
             className="w-full h-10 shadow-sm rounded-lg flex items-center justify-center gap-2"
           >
-            <Square className="w-4 h-4 fill-current" /> Stop & Close Worker
+            <Square className="w-4 h-4 fill-current" /> Abort Workload
           </Button>
         ) : (
           <div className="flex flex-col gap-2">
@@ -1381,7 +1469,7 @@ function App() {
                   onClick={handleSaveRecipe}
                   className="text-[10px] text-muted-foreground hover:text-primary flex items-center gap-1 uppercase tracking-wider font-semibold transition-colors"
                 >
-                  <Save className="w-3 h-3" /> Save as Recipe
+                  <Save className="w-3 h-3" /> Save Template
                 </button>
               </div>
             )}
