@@ -1,11 +1,13 @@
 import {
+  Bookmark,
   BoxSelect,
   Check,
+  ExternalLink,
   Layers,
   Link2,
   MousePointer2,
   MousePointerClick,
-  Play,
+  Save,
   Square,
   Trash2,
   X,
@@ -32,6 +34,7 @@ interface ScrapedNode {
   clickSelector?: string
 }
 
+// UPGRADED RECIPE INTERFACE to support Deep Scrape configurations
 interface Recipe {
   id: string
   domain: string
@@ -48,11 +51,9 @@ const randomSleep = (min: number, max: number) =>
     setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min),
   )
 
-// Safe navigation wrapper to ensure the page loads before we scrape
 const navigateAndWait = (tabId: number, url: string, timeoutMs = 15000) => {
   return new Promise<boolean>((resolve) => {
     let resolved = false
-
     const listener = (
       updatedTabId: number,
       info: chrome.tabs.TabChangeInfo,
@@ -61,15 +62,12 @@ const navigateAndWait = (tabId: number, url: string, timeoutMs = 15000) => {
         if (!resolved) {
           resolved = true
           chrome.tabs.onUpdated.removeListener(listener)
-          setTimeout(() => resolve(true), 2500) // Give JS frameworks time to render
+          setTimeout(() => resolve(true), 2500)
         }
       }
     }
-
     chrome.tabs.onUpdated.addListener(listener)
     chrome.tabs.update(tabId, { url })
-
-    // Fallback if page gets stuck loading
     setTimeout(() => {
       if (!resolved) {
         resolved = true
@@ -90,14 +88,12 @@ function App() {
     "column" | "pagination" | "container" | "clickAction"
   >("column")
 
-  // Selection Routing Refs
   const targetSchemaRef = useRef<"surface" | "deep">("surface")
   const activeClickActionIdRef = useRef<string | null>(null)
 
   const [isScraping, setIsScraping] = useState(false)
   const [statusText, setStatusText] = useState("")
 
-  // Surface State
   const [scrapedNodes, setScrapedNodes] = useState<ScrapedNode[]>([])
   const [containerSelector, setContainerSelector] = useState<string | null>(
     null,
@@ -107,7 +103,6 @@ function App() {
     null,
   )
 
-  // Deep Scrape State
   const [isDeepScrapeEnabled, setIsDeepScrapeEnabled] = useState(false)
   const [deepNodes, setDeepNodes] = useState<ScrapedNode[]>([])
   const [deepLinkColumn, setDeepLinkColumn] = useState<string>("")
@@ -116,8 +111,11 @@ function App() {
   const [maxPages, setMaxPages] = useState<number>(3)
   const [exportFormat, setExportFormat] = useState<"csv" | "json">("json")
 
+  // RESTORED RECIPE STATE
   const [activeDomain, setActiveDomain] = useState<string>("")
   const [recipes, setRecipes] = useState<Record<string, Recipe[]>>({})
+  const [suggestedRecipe, setSuggestedRecipe] = useState<Recipe | null>(null)
+  const [showRecipeManager, setShowRecipeManager] = useState(false)
 
   const abortController = useRef(false)
 
@@ -129,11 +127,20 @@ function App() {
       })
       if (tab?.url) {
         try {
-          setActiveDomain(new URL(tab.url).hostname.replace("www.", ""))
+          const domain = new URL(tab.url).hostname.replace("www.", "")
+          setActiveDomain(domain)
+          chrome.storage.local.get(["scrapy_recipes"], (result) => {
+            if (result.scrapy_recipes) {
+              setRecipes(result.scrapy_recipes)
+              if (
+                result.scrapy_recipes[domain] &&
+                result.scrapy_recipes[domain].length > 0
+              ) {
+                setSuggestedRecipe(result.scrapy_recipes[domain][0])
+              }
+            }
+          })
         } catch (e) {}
-        chrome.storage.local.get(["scrapy_recipes"], (result) => {
-          if (result.scrapy_recipes) setRecipes(result.scrapy_recipes)
-        })
       }
     }
     init()
@@ -149,13 +156,9 @@ function App() {
           attribute: "text",
           availableAttributes: message.payload.attributes,
         }
-
-        // Route to Surface or Deep schema based on ref
-        if (targetSchemaRef.current === "surface") {
+        if (targetSchemaRef.current === "surface")
           setScrapedNodes((prev) => [...prev, newNode])
-        } else {
-          setDeepNodes((prev) => [...prev, newNode])
-        }
+        else setDeepNodes((prev) => [...prev, newNode])
       }
 
       if (
@@ -164,7 +167,7 @@ function App() {
       ) {
         setIsSelecting(false)
         const colId = activeClickActionIdRef.current
-        if (targetSchemaRef.current === "surface") {
+        if (targetSchemaRef.current === "surface")
           setScrapedNodes((prev) =>
             prev.map((n) =>
               n.id === colId
@@ -172,7 +175,7 @@ function App() {
                 : n,
             ),
           )
-        } else {
+        else
           setDeepNodes((prev) =>
             prev.map((n) =>
               n.id === colId
@@ -180,7 +183,6 @@ function App() {
                 : n,
             ),
           )
-        }
         activeClickActionIdRef.current = null
         setSelectionMode("column")
       }
@@ -200,6 +202,65 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
   }, [])
 
+  // RESTORED RECIPE FUNCTIONS
+  const handleSaveRecipe = () => {
+    const recipeName = prompt(
+      "Enter a name for this recipe template:",
+      `${activeDomain} template`,
+    )
+    if (!recipeName) return
+
+    const newRecipe: Recipe = {
+      id: crypto.randomUUID(),
+      domain: activeDomain,
+      name: recipeName,
+      schema: scrapedNodes,
+      deepSchema: deepNodes,
+      container: containerSelector,
+      pagination: paginationSelector,
+      deepLinkColumn: deepLinkColumn,
+    }
+
+    const updatedRecipes = { ...recipes }
+    if (!updatedRecipes[activeDomain]) updatedRecipes[activeDomain] = []
+    updatedRecipes[activeDomain].push(newRecipe)
+
+    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
+      setRecipes(updatedRecipes)
+      alert("Recipe Saved!")
+    })
+  }
+
+  const loadRecipe = (recipe: Recipe) => {
+    setScrapedNodes(recipe.schema)
+    setContainerSelector(recipe.container)
+    setPaginationSelector(recipe.pagination)
+
+    // Load Deep Scrape config if it exists
+    if (recipe.deepSchema && recipe.deepSchema.length > 0) {
+      setIsDeepScrapeEnabled(true)
+      setDeepNodes(recipe.deepSchema)
+      setDeepLinkColumn(recipe.deepLinkColumn || "")
+    } else {
+      setIsDeepScrapeEnabled(false)
+      setDeepNodes([])
+      setDeepLinkColumn("")
+    }
+
+    setSuggestedRecipe(null)
+    setShowRecipeManager(false)
+  }
+
+  const deleteRecipe = (domain: string, id: string) => {
+    const updatedRecipes = { ...recipes }
+    updatedRecipes[domain] = updatedRecipes[domain].filter((r) => r.id !== id)
+    if (updatedRecipes[domain].length === 0) delete updatedRecipes[domain]
+
+    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
+      setRecipes(updatedRecipes)
+    })
+  }
+
   const toggleScraper = async (
     mode: "column" | "pagination" | "container" | "clickAction",
     target: "surface" | "deep" = "surface",
@@ -207,7 +268,6 @@ function App() {
   ) => {
     targetSchemaRef.current = target
     activeClickActionIdRef.current = colId || null
-
     try {
       const [tab] = await chrome.tabs.query({
         active: true,
@@ -248,7 +308,7 @@ function App() {
 
   const convertToCSV = (objArray: any[]) => {
     if (objArray.length === 0) return ""
-    const headers = Object.keys(Object.assign({}, ...objArray)) // Ensure all dynamic keys are captured
+    const headers = Object.keys(Object.assign({}, ...objArray))
     const rows = [headers.join(",")]
     for (const row of objArray) {
       const values = headers.map(
@@ -263,23 +323,39 @@ function App() {
   const handleScrapeAndDownload = async () => {
     abortController.current = false
     setIsScraping(true)
+    setSuggestedRecipe(null) // Hide banners
+
     let allData: any[] = []
     let currentPage = 1
     const keepScraping = true
+    let workerWindowId: number | null = null
 
     try {
       const [initTab] = await chrome.tabs.query({
         active: true,
         lastFocusedWindow: true,
       })
-      if (!initTab?.id) throw new Error("No active tab found")
-      const baseTabId = initTab.id
+      const startUrl = initTab?.url
+      if (!startUrl) throw new Error("No active URL found to start scraping.")
 
-      chrome.tabs.sendMessage(baseTabId, { action: "BLOCK_UI" })
+      setStatusText("Spawning isolated worker window...")
 
-      // ==========================================
-      // PHASE 1: SURFACE SCRAPE (LIST PAGES)
-      // ==========================================
+      const workerWindow = await chrome.windows.create({
+        url: startUrl,
+        type: "popup",
+        width: 1000,
+        height: 800,
+        focused: true,
+      })
+
+      workerWindowId = workerWindow.id || null
+      const workerTabId = workerWindow.tabs?.[0]?.id
+      if (!workerTabId) throw new Error("Failed to attach to worker tab.")
+
+      await navigateAndWait(workerTabId, startUrl)
+      chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
+
+      // PHASE 1: SURFACE SCRAPE
       while (keepScraping) {
         if (abortController.current) {
           setStatusText("Aborted.")
@@ -289,7 +365,7 @@ function App() {
         setStatusText(`Scrolling Surface Page ${currentPage}...`)
         await new Promise((resolve) =>
           chrome.tabs.sendMessage(
-            baseTabId,
+            workerTabId,
             { action: "SCROLL_PAGE" },
             resolve,
           ),
@@ -298,7 +374,7 @@ function App() {
         setStatusText(`Extracting Surface Data ${currentPage}...`)
         const scrapeRes: any = await new Promise((resolve) => {
           chrome.tabs.sendMessage(
-            baseTabId,
+            workerTabId,
             {
               action: "EXECUTE_SCRAPE",
               payload: { schema: scrapedNodes, containerSelector },
@@ -315,13 +391,12 @@ function App() {
 
         if (abortController.current) break
 
-        // Pagination Check
         if (paginationSelector) {
           if (pageLimitMode === "custom" && currentPage >= maxPages) break
           setStatusText(`Clicking next page...`)
           const clickRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
-              baseTabId,
+              workerTabId,
               {
                 action: "CLICK_NEXT",
                 payload: { selector: paginationSelector },
@@ -333,15 +408,13 @@ function App() {
 
           await randomSleep(3000, 5000)
           currentPage++
-          chrome.tabs.sendMessage(baseTabId, { action: "BLOCK_UI" })
+          chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
         } else {
           break
         }
       }
 
-      // ==========================================
-      // PHASE 2: DEEP SCRAPE (PROFILE PAGES)
-      // ==========================================
+      // PHASE 2: DEEP SCRAPE
       if (
         !abortController.current &&
         isDeepScrapeEnabled &&
@@ -356,7 +429,6 @@ function App() {
 
           const targetUrl = allData[i][deepLinkColumn]
 
-          // Validate URL
           if (
             !targetUrl ||
             typeof targetUrl !== "string" ||
@@ -370,19 +442,16 @@ function App() {
             `Deep Scraping Profile ${i + 1} of ${allData.length}...`,
           )
 
-          // Navigate Main Tab to the Profile Page & Wait
-          const loadSuccess = await navigateAndWait(baseTabId, targetUrl)
+          const loadSuccess = await navigateAndWait(workerTabId, targetUrl)
 
           if (!loadSuccess) {
             allData[i]["_deep_scrape_status"] = "Timeout"
             continue
           }
 
-          // Execute Deep Extraction
           const deepRes: any = await new Promise((resolve) => {
-            // No container needed for detail pages usually, we scrape the whole page
             chrome.tabs.sendMessage(
-              baseTabId,
+              workerTabId,
               { action: "EXECUTE_SCRAPE", payload: { schema: deepNodes } },
               resolve,
             )
@@ -393,22 +462,17 @@ function App() {
             deepRes.data &&
             deepRes.data.length > 0
           ) {
-            // Detail pages return 1 row of data. Merge it into our Surface row.
             allData[i] = { ...allData[i], ...deepRes.data[0] }
           } else {
             allData[i]["_deep_scrape_status"] = "Failed Extraction"
           }
 
-          // Human Jitter to prevent bans
           await randomSleep(2000, 4500)
         }
       }
 
-      // ==========================================
       // PHASE 3: FINALIZATION
-      // ==========================================
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
-      chrome.tabs.sendMessage(baseTabId, { action: "UNBLOCK_UI" })
 
       if (allData.length > 0) {
         let blob: Blob
@@ -433,13 +497,17 @@ function App() {
     } catch (error) {
       console.error("Scraping loop failed", error)
     } finally {
+      if (workerWindowId) {
+        chrome.windows
+          .remove(workerWindowId)
+          .catch((err) => console.error("Failed to close worker window", err))
+      }
       setIsScraping(false)
       setStatusText("")
       abortController.current = false
     }
   }
 
-  // Node UI Renderer Helper
   const renderNodeControls = (
     node: ScrapedNode,
     target: "surface" | "deep",
@@ -572,6 +640,71 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
+      {/* RESTORED RECIPE MANAGER OVERLAY */}
+      {showRecipeManager && (
+        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
+          <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
+            <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
+              <Bookmark className="w-4 h-4" /> Saved Recipes
+            </h2>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="w-6 h-6 hover:bg-secondary/50"
+              onClick={() => setShowRecipeManager(false)}
+            >
+              <X className="w-4 h-4" />
+            </Button>
+          </header>
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            {Object.keys(recipes).length === 0 && (
+              <p className="text-xs text-muted-foreground text-center mt-10">
+                No recipes saved yet.
+              </p>
+            )}
+            {Object.entries(recipes).map(([domain, domainRecipes]) => (
+              <div key={domain} className="space-y-2">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
+                  {domain}
+                </p>
+                {domainRecipes.map((recipe) => (
+                  <div
+                    key={recipe.id}
+                    className="flex items-center justify-between p-3 bg-secondary/10 border border-border/30 rounded-lg group"
+                  >
+                    <div>
+                      <p className="text-xs font-medium text-foreground">
+                        {recipe.name}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground">
+                        {recipe.schema.length} columns defined
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => deleteRecipe(domain, recipe.id)}
+                        className="h-7 text-xs text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        Delete
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={() => loadRecipe(recipe)}
+                        className="h-7 text-xs bg-primary text-primary-foreground"
+                      >
+                        Load
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <header className="flex items-center justify-between px-4 py-3 border-b border-border/40 shrink-0 bg-background/95 backdrop-blur z-10">
         <div className="flex items-center gap-2 text-primary">
           <BoxSelect className="w-4 h-4" />{" "}
@@ -579,20 +712,64 @@ function App() {
             Web Scrapy Engine
           </span>
         </div>
-        {!isScraping && scrapedNodes.length > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={clearSelection}
-            className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-destructive"
-          >
-            Reset Tool
-          </Button>
+        {!isScraping && (
+          <div className="flex items-center gap-1">
+            {/* RESTORED RECIPES BUTTON */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowRecipeManager(true)}
+              className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground flex gap-1"
+            >
+              Recipes{" "}
+              <span className="bg-primary/20 text-primary px-1.5 py-0.5 rounded text-[8px]">
+                {Object.values(recipes).flat().length}
+              </span>
+            </Button>
+            {(scrapedNodes.length > 0 || deepNodes.length > 0) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearSelection}
+                className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-destructive"
+              >
+                Clear
+              </Button>
+            )}
+          </div>
         )}
       </header>
 
       <main className="flex-1 overflow-y-auto p-4 space-y-8 custom-scrollbar">
-        {/* Step 1 & 2: Surface Scrape Config */}
+        {/* RESTORED SUGGESTED RECIPE BANNER */}
+        {suggestedRecipe && !isScraping && (
+          <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-2 text-primary">
+              <Bookmark className="w-4 h-4" />{" "}
+              <span className="text-xs font-medium">
+                Found template: {suggestedRecipe.name}
+              </span>
+            </div>
+            <div className="flex gap-1">
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-6 w-6 text-primary hover:bg-primary/20"
+                onClick={() => setSuggestedRecipe(null)}
+              >
+                <X className="w-3 h-3" />
+              </Button>
+              <Button
+                size="sm"
+                className="h-6 text-[10px] px-2 bg-primary text-primary-foreground"
+                onClick={() => loadRecipe(suggestedRecipe)}
+              >
+                Load
+              </Button>
+            </div>
+          </div>
+        )}
+
         <section className="space-y-4 pb-4 border-b border-border/40">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold tracking-wide text-foreground">
@@ -656,7 +833,6 @@ function App() {
           </div>
         </section>
 
-        {/* Step 3: Deep Scrape Config */}
         <section className="space-y-4 pb-4 border-b border-border/40">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -673,7 +849,6 @@ function App() {
               <Label className="text-[10px] uppercase text-muted-foreground">
                 Enable
               </Label>
-              {/* Fallback switch if shadcn switch isn't working/installed properly, but we'll use standard inputs for safety */}
               <input
                 type="checkbox"
                 checked={isDeepScrapeEnabled}
@@ -743,7 +918,6 @@ function App() {
           )}
         </section>
 
-        {/* Step 4: Pagination */}
         <section className="space-y-3">
           <div className="flex items-center justify-between text-muted-foreground">
             <h2 className="text-sm font-semibold tracking-wide text-foreground">
@@ -803,7 +977,6 @@ function App() {
         </section>
       </main>
 
-      {/* Execution Footer */}
       <footer className="px-4 py-4 border-t border-border/40 shrink-0 bg-background/95 backdrop-blur z-10 space-y-3">
         {statusText && (
           <p className="text-[10px] uppercase tracking-wider text-primary text-center font-bold animate-pulse">
@@ -818,34 +991,47 @@ function App() {
             variant="destructive"
             className="w-full h-10 shadow-sm rounded-lg flex items-center justify-center gap-2"
           >
-            <Square className="w-4 h-4 fill-current" /> Emergency Stop
+            <Square className="w-4 h-4 fill-current" /> Stop & Close Worker
           </Button>
         ) : (
-          <div className="flex gap-2">
-            <Select
-              disabled={scrapedNodes.length === 0}
-              value={exportFormat}
-              onValueChange={(val: "csv" | "json") => setExportFormat(val)}
-            >
-              <SelectTrigger className="w-[85px] h-10 text-xs bg-secondary/50 border-border/50 rounded-lg shadow-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className="border-border min-w-[85px]">
-                <SelectItem value="json" className="text-xs font-mono">
-                  .JSON
-                </SelectItem>
-                <SelectItem value="csv" className="text-xs font-mono">
-                  .CSV
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              disabled={scrapedNodes.length === 0}
-              onClick={() => handleScrapeAndDownload()}
-              className="flex-1 h-10 rounded-lg shadow-sm font-medium flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" /> Execute Workflow
-            </Button>
+          <div className="flex flex-col gap-2">
+            {/* RESTORED SAVE RECIPE BUTTON */}
+            {(scrapedNodes.length > 0 || deepNodes.length > 0) && (
+              <div className="flex justify-end mb-1">
+                <button
+                  onClick={handleSaveRecipe}
+                  className="text-[10px] text-muted-foreground hover:text-primary flex items-center gap-1 uppercase tracking-wider font-semibold transition-colors"
+                >
+                  <Save className="w-3 h-3" /> Save as Recipe
+                </button>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Select
+                disabled={scrapedNodes.length === 0}
+                value={exportFormat}
+                onValueChange={(val: "csv" | "json") => setExportFormat(val)}
+              >
+                <SelectTrigger className="w-[85px] h-10 text-xs bg-secondary/50 border-border/50 rounded-lg shadow-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-border min-w-[85px]">
+                  <SelectItem value="json" className="text-xs font-mono">
+                    .JSON
+                  </SelectItem>
+                  <SelectItem value="csv" className="text-xs font-mono">
+                    .CSV
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                disabled={scrapedNodes.length === 0}
+                onClick={() => handleScrapeAndDownload()}
+                className="flex-1 h-10 rounded-lg shadow-sm font-medium flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
+              >
+                <ExternalLink className="w-4 h-4" /> Start Background Scrape
+              </Button>
+            </div>
           </div>
         )}
       </footer>
