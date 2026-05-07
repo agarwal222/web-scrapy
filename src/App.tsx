@@ -1,4 +1,7 @@
 import {
+  ArrowDownToLine,
+  ArrowRightToLine,
+  Ban,
   Bookmark,
   BoxSelect,
   Check,
@@ -34,7 +37,8 @@ interface ScrapedNode {
   clickSelector?: string
 }
 
-// UPGRADED RECIPE INTERFACE to support Deep Scrape configurations
+type NavMode = "none" | "next" | "loadMore" | "infinite"
+
 interface Recipe {
   id: string
   domain: string
@@ -42,6 +46,7 @@ interface Recipe {
   schema: ScrapedNode[]
   deepSchema: ScrapedNode[]
   container: string | null
+  navMode: NavMode
   pagination: string | null
   deepLinkColumn: string | null
 }
@@ -99,6 +104,9 @@ function App() {
     null,
   )
   const [containerCount, setContainerCount] = useState<number>(0)
+
+  // NEW: Multi-Modal Navigation State
+  const [navMode, setNavMode] = useState<NavMode>("none")
   const [paginationSelector, setPaginationSelector] = useState<string | null>(
     null,
   )
@@ -111,7 +119,6 @@ function App() {
   const [maxPages, setMaxPages] = useState<number>(3)
   const [exportFormat, setExportFormat] = useState<"csv" | "json">("json")
 
-  // RESTORED RECIPE STATE
   const [activeDomain, setActiveDomain] = useState<string>("")
   const [recipes, setRecipes] = useState<Record<string, Recipe[]>>({})
   const [suggestedRecipe, setSuggestedRecipe] = useState<Recipe | null>(null)
@@ -202,10 +209,9 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
   }, [])
 
-  // RESTORED RECIPE FUNCTIONS
   const handleSaveRecipe = () => {
     const recipeName = prompt(
-      "Enter a name for this recipe template:",
+      "Enter a name for this template:",
       `${activeDomain} template`,
     )
     if (!recipeName) return
@@ -217,6 +223,7 @@ function App() {
       schema: scrapedNodes,
       deepSchema: deepNodes,
       container: containerSelector,
+      navMode: navMode,
       pagination: paginationSelector,
       deepLinkColumn: deepLinkColumn,
     }
@@ -234,9 +241,9 @@ function App() {
   const loadRecipe = (recipe: Recipe) => {
     setScrapedNodes(recipe.schema)
     setContainerSelector(recipe.container)
+    setNavMode(recipe.navMode || (recipe.pagination ? "next" : "none")) // Backwards compatibility
     setPaginationSelector(recipe.pagination)
 
-    // Load Deep Scrape config if it exists
     if (recipe.deepSchema && recipe.deepSchema.length > 0) {
       setIsDeepScrapeEnabled(true)
       setDeepNodes(recipe.deepSchema)
@@ -246,7 +253,6 @@ function App() {
       setDeepNodes([])
       setDeepLinkColumn("")
     }
-
     setSuggestedRecipe(null)
     setShowRecipeManager(false)
   }
@@ -255,10 +261,9 @@ function App() {
     const updatedRecipes = { ...recipes }
     updatedRecipes[domain] = updatedRecipes[domain].filter((r) => r.id !== id)
     if (updatedRecipes[domain].length === 0) delete updatedRecipes[domain]
-
-    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
-      setRecipes(updatedRecipes)
-    })
+    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () =>
+      setRecipes(updatedRecipes),
+    )
   }
 
   const toggleScraper = async (
@@ -297,6 +302,7 @@ function App() {
     setPaginationSelector(null)
     setContainerSelector(null)
     setIsDeepScrapeEnabled(false)
+    setNavMode("none")
     chrome.tabs
       .query({ active: true, lastFocusedWindow: true })
       .then(
@@ -323,8 +329,7 @@ function App() {
   const handleScrapeAndDownload = async () => {
     abortController.current = false
     setIsScraping(true)
-    setSuggestedRecipe(null) // Hide banners
-
+    setSuggestedRecipe(null)
     let allData: any[] = []
     let currentPage = 1
     const keepScraping = true
@@ -339,7 +344,6 @@ function App() {
       if (!startUrl) throw new Error("No active URL found to start scraping.")
 
       setStatusText("Spawning isolated worker window...")
-
       const workerWindow = await chrome.windows.create({
         url: startUrl,
         type: "popup",
@@ -347,7 +351,6 @@ function App() {
         height: 800,
         focused: true,
       })
-
       workerWindowId = workerWindow.id || null
       const workerTabId = workerWindow.tabs?.[0]?.id
       if (!workerTabId) throw new Error("Failed to attach to worker tab.")
@@ -355,7 +358,9 @@ function App() {
       await navigateAndWait(workerTabId, startUrl)
       chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
 
-      // PHASE 1: SURFACE SCRAPE
+      // ==========================================
+      // PHASE 1: SURFACE SCRAPE (LIST PAGES)
+      // ==========================================
       while (keepScraping) {
         if (abortController.current) {
           setStatusText("Aborted.")
@@ -370,6 +375,7 @@ function App() {
             resolve,
           ),
         )
+        await randomSleep(800, 1500) // Wait for lazy load images
 
         setStatusText(`Extracting Surface Data ${currentPage}...`)
         const scrapeRes: any = await new Promise((resolve) => {
@@ -390,10 +396,33 @@ function App() {
         }
 
         if (abortController.current) break
+        if (navMode === "none") break // Single page scrape
+        if (pageLimitMode === "custom" && currentPage >= maxPages) break
 
-        if (paginationSelector) {
-          if (pageLimitMode === "custom" && currentPage >= maxPages) break
-          setStatusText(`Clicking next page...`)
+        // Routing Navigation Mechanics
+        if (navMode === "infinite") {
+          setStatusText(`Loading more via Scroll...`)
+          await randomSleep(3000, 5000)
+          currentPage++
+        } else if (navMode === "loadMore") {
+          if (!paginationSelector) break
+          setStatusText(`Clicking Load More...`)
+          const clickRes: any = await new Promise((resolve) =>
+            chrome.tabs.sendMessage(
+              workerTabId,
+              {
+                action: "CLICK_NEXT",
+                payload: { selector: paginationSelector },
+              },
+              resolve,
+            ),
+          )
+          if (clickRes?.status !== "success") break // Button gone or disabled
+          await randomSleep(3000, 5000)
+          currentPage++
+        } else if (navMode === "next") {
+          if (!paginationSelector) break
+          setStatusText(`Navigating to next page...`)
           const clickRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
@@ -405,16 +434,25 @@ function App() {
             ),
           )
           if (clickRes?.status !== "success") break
-
-          await randomSleep(3000, 5000)
+          await randomSleep(4000, 6000) // Extra time for a full page refresh
           currentPage++
-          chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
-        } else {
-          break
+          chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" }) // Re-apply UI block after refresh
         }
       }
 
-      // PHASE 2: DEEP SCRAPE
+      // ==========================================
+      // CRITICAL DATA HYGIENE: DEDUPLICATION
+      // ==========================================
+      setStatusText(`Deduplicating rows...`)
+      // Since Infinite Scroll & Load More repeatedly scrape the entire DOM, we must purge duplicates before deep scraping.
+      const uniqueData = Array.from(
+        new Set(allData.map((a) => JSON.stringify(a))),
+      ).map((a) => JSON.parse(a))
+      allData = uniqueData
+
+      // ==========================================
+      // PHASE 2: DEEP SCRAPE (PROFILE PAGES)
+      // ==========================================
       if (
         !abortController.current &&
         isDeepScrapeEnabled &&
@@ -428,7 +466,6 @@ function App() {
           }
 
           const targetUrl = allData[i][deepLinkColumn]
-
           if (
             !targetUrl ||
             typeof targetUrl !== "string" ||
@@ -441,7 +478,6 @@ function App() {
           setStatusText(
             `Deep Scraping Profile ${i + 1} of ${allData.length}...`,
           )
-
           const loadSuccess = await navigateAndWait(workerTabId, targetUrl)
 
           if (!loadSuccess) {
@@ -466,14 +502,14 @@ function App() {
           } else {
             allData[i]["_deep_scrape_status"] = "Failed Extraction"
           }
-
-          await randomSleep(2000, 4500)
+          await randomSleep(2000, 4000)
         }
       }
 
+      // ==========================================
       // PHASE 3: FINALIZATION
+      // ==========================================
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
-
       if (allData.length > 0) {
         let blob: Blob
         let filename: string
@@ -497,11 +533,10 @@ function App() {
     } catch (error) {
       console.error("Scraping loop failed", error)
     } finally {
-      if (workerWindowId) {
+      if (workerWindowId)
         chrome.windows
           .remove(workerWindowId)
-          .catch((err) => console.error("Failed to close worker window", err))
-      }
+          .catch((err) => console.error("Failed to close worker", err))
       setIsScraping(false)
       setStatusText("")
       abortController.current = false
@@ -640,7 +675,6 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* RESTORED RECIPE MANAGER OVERLAY */}
       {showRecipeManager && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
@@ -677,7 +711,7 @@ function App() {
                         {recipe.name}
                       </p>
                       <p className="text-[10px] text-muted-foreground">
-                        {recipe.schema.length} columns defined
+                        {recipe.schema.length} cols • {recipe.navMode}
                       </p>
                     </div>
                     <div className="flex gap-2">
@@ -714,7 +748,6 @@ function App() {
         </div>
         {!isScraping && (
           <div className="flex items-center gap-1">
-            {/* RESTORED RECIPES BUTTON */}
             <Button
               variant="ghost"
               size="sm"
@@ -741,7 +774,6 @@ function App() {
       </header>
 
       <main className="flex-1 overflow-y-auto p-4 space-y-8 custom-scrollbar">
-        {/* RESTORED SUGGESTED RECIPE BANNER */}
         {suggestedRecipe && !isScraping && (
           <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg flex items-center justify-between shrink-0">
             <div className="flex items-center gap-2 text-primary">
@@ -918,62 +950,120 @@ function App() {
           )}
         </section>
 
+        {/* REBUILT NAVIGATION SECTION */}
         <section className="space-y-3">
           <div className="flex items-center justify-between text-muted-foreground">
             <h2 className="text-sm font-semibold tracking-wide text-foreground">
-              Pagination
+              Navigation & Pagination
             </h2>
-            <Button
-              onClick={() => toggleScraper("pagination")}
-              disabled={isScraping}
-              variant="ghost"
-              size="sm"
-              className="h-7 text-xs"
-            >
-              + Set Next Button
-            </Button>
           </div>
-          {paginationSelector && (
-            <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-medium">Scrape Limit</span>
-                <Select
-                  disabled={isScraping}
-                  value={pageLimitMode}
-                  onValueChange={(val: "all" | "custom") =>
-                    setPageLimitMode(val)
-                  }
-                >
-                  <SelectTrigger className="w-[110px] h-7 text-xs bg-background">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="border-border">
-                    <SelectItem value="custom" className="text-xs">
-                      Custom Range
-                    </SelectItem>
-                    <SelectItem value="all" className="text-xs">
-                      All Pages
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              {pageLimitMode === "custom" && (
-                <div className="flex items-center justify-between pt-1">
-                  <span className="text-xs text-muted-foreground">
-                    Pages to crawl
-                  </span>
-                  <Input
-                    disabled={isScraping}
-                    type="number"
-                    value={maxPages}
-                    onChange={(e) => setMaxPages(Number(e.target.value))}
-                    className="w-16 h-7 text-xs bg-background text-center px-1"
-                    min={1}
-                  />
-                </div>
-              )}
+
+          <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-4">
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">Mode</Label>
+              <Select
+                disabled={isScraping}
+                value={navMode}
+                onValueChange={(val: NavMode) => setNavMode(val)}
+              >
+                <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50 shadow-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-border">
+                  <SelectItem
+                    value="none"
+                    className="text-xs flex items-center gap-2"
+                  >
+                    <Ban className="w-3 h-3 inline mr-1" /> Single Page Only
+                  </SelectItem>
+                  <SelectItem
+                    value="next"
+                    className="text-xs flex items-center gap-2"
+                  >
+                    <ArrowRightToLine className="w-3 h-3 inline mr-1" /> Click
+                    'Next Page'
+                  </SelectItem>
+                  <SelectItem
+                    value="loadMore"
+                    className="text-xs flex items-center gap-2"
+                  >
+                    <MousePointerClick className="w-3 h-3 inline mr-1" /> Click
+                    'Load More'
+                  </SelectItem>
+                  <SelectItem
+                    value="infinite"
+                    className="text-xs flex items-center gap-2"
+                  >
+                    <ArrowDownToLine className="w-3 h-3 inline mr-1" /> Infinite
+                    Scroll
+                  </SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-          )}
+
+            {(navMode === "next" || navMode === "loadMore") && (
+              <div className="space-y-1.5 pt-2 border-t border-border/30">
+                <Label className="text-xs text-muted-foreground">
+                  Target Button
+                </Label>
+                <Button
+                  onClick={() => toggleScraper("pagination")}
+                  disabled={isScraping}
+                  variant="outline"
+                  size="sm"
+                  className={`w-full text-xs h-8 border-dashed ${paginationSelector ? "border-solid bg-background" : ""}`}
+                >
+                  {paginationSelector
+                    ? "Target Locked"
+                    : "+ Select Button on Page"}
+                </Button>
+              </div>
+            )}
+
+            {navMode !== "none" && (
+              <div className="space-y-2 pt-2 border-t border-border/30">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-muted-foreground">
+                    Scrape Limit
+                  </Label>
+                  <Select
+                    disabled={isScraping}
+                    value={pageLimitMode}
+                    onValueChange={(val: "all" | "custom") =>
+                      setPageLimitMode(val)
+                    }
+                  >
+                    <SelectTrigger className="w-[110px] h-7 text-xs bg-background shadow-sm">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="border-border">
+                      <SelectItem value="custom" className="text-xs">
+                        Custom Limit
+                      </SelectItem>
+                      <SelectItem value="all" className="text-xs">
+                        Exhaust Site
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {pageLimitMode === "custom" && (
+                  <div className="flex items-center justify-between pt-1">
+                    <span className="text-xs text-muted-foreground">
+                      Max passes
+                    </span>
+                    <Input
+                      disabled={isScraping}
+                      type="number"
+                      value={maxPages}
+                      onChange={(e) => setMaxPages(Number(e.target.value))}
+                      className="w-16 h-7 text-xs bg-background text-center px-1"
+                      min={1}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </section>
       </main>
 
@@ -995,7 +1085,6 @@ function App() {
           </Button>
         ) : (
           <div className="flex flex-col gap-2">
-            {/* RESTORED SAVE RECIPE BUTTON */}
             {(scrapedNodes.length > 0 || deepNodes.length > 0) && (
               <div className="flex justify-end mb-1">
                 <button
