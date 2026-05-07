@@ -6,7 +6,7 @@ style.textContent = `
   .web-scrapy-selected { outline: 2px dashed #10b981 !important; outline-offset: -2px !important; background-color: rgba(16, 185, 129, 0.1) !important; }
   .web-scrapy-pagination-selected { outline: 2px dashed #d946ef !important; outline-offset: -2px !important; background-color: rgba(217, 70, 239, 0.1) !important; }
   .web-scrapy-container-selected { outline: 2px dashed #f59e0b !important; outline-offset: -2px !important; background-color: rgba(245, 158, 11, 0.1) !important; }
-  .web-scrapy-action-selected { outline: 2px dashed #e11d48 !important; outline-offset: -2px !important; background-color: rgba(225, 29, 72, 0.1) !important; } /* Rose color for clicks */
+  .web-scrapy-action-selected { outline: 2px dashed #e11d48 !important; outline-offset: -2px !important; background-color: rgba(225, 29, 72, 0.1) !important; }
   #web-scrapy-glass-shield { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2147483647; cursor: not-allowed; background: transparent; }
 `
 document.head.appendChild(style)
@@ -22,7 +22,6 @@ let selectedElements: HTMLElement[] = []
 let paginationElement: HTMLElement | null = null
 let containerElements: HTMLElement[] = []
 
-// Helper: Async Sleep
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const generateSelector = (el: HTMLElement): string => {
@@ -113,7 +112,6 @@ const handleClick = (e: MouseEvent) => {
         },
       })
     } else if (currentSelectionMode === "clickAction") {
-      // Send the selector back, visually highlight it
       hoveredElement.classList.add("web-scrapy-action-selected")
       selectedElements.push(hoveredElement)
       chrome.runtime.sendMessage({
@@ -200,7 +198,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true
   }
 
-  // REWRITTEN ENGINE: Asynchronous & Smart Action Fallbacks
   if (request.action === "EXECUTE_SCRAPE") {
     ;(async () => {
       try {
@@ -216,21 +213,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
 
-            // 1. SMART EXECUTION: Handle Pre-Scrape Actions First
+            // 1. SMART EXECUTION: Process Action Pipeline Safely
             for (const col of schema) {
-              if (col.clickSelector) {
-                const btn = container.querySelector(
-                  col.clickSelector,
-                ) as HTMLElement
-                // If found, click it and wait. If not found, skip gracefully.
-                if (btn) {
-                  btn.click()
-                  await sleep(400) // Wait for the DOM element to reveal data
+              if (col.actions && col.actions.length > 0) {
+                for (const action of col.actions) {
+                  try {
+                    if (action.type === "click" && action.selector) {
+                      const btn = container.querySelector(
+                        action.selector,
+                      ) as HTMLElement
+                      if (btn) btn.click()
+                    } else if (action.type === "wait") {
+                      await sleep(Number(action.value) || 500)
+                    } else if (action.type === "type" && action.selector) {
+                      const input = container.querySelector(
+                        action.selector,
+                      ) as HTMLInputElement
+                      if (input) {
+                        input.value = action.value || ""
+                        input.dispatchEvent(
+                          new Event("input", { bubbles: true }),
+                        )
+                        input.dispatchEvent(
+                          new Event("change", { bubbles: true }),
+                        )
+                      }
+                    }
+                  } catch (e) {
+                    console.warn("Action skipped safely.")
+                  }
                 }
               }
             }
 
-            // 2. EXTRACTION: Pull the data after actions complete
+            // 2. EXTRACTION
             for (const col of schema) {
               const el = container.querySelector(col.selector) as HTMLElement
               let val = ""
@@ -248,16 +264,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
         } else {
           // Legacy Mode (No Container)
-          // Pre-scrape globally if needed
           for (const col of schema) {
-            if (col.clickSelector) {
-              const btns = Array.from(
-                document.querySelectorAll(col.clickSelector),
-              ) as HTMLElement[]
-              btns.forEach((b) => b.click())
+            if (col.actions && col.actions.length > 0) {
+              for (const action of col.actions) {
+                try {
+                  if (action.type === "click" && action.selector) {
+                    const btns = Array.from(
+                      document.querySelectorAll(action.selector),
+                    ) as HTMLElement[]
+                    btns.forEach((b) => b.click())
+                  } else if (action.type === "wait") {
+                    await sleep(Number(action.value) || 500)
+                  } else if (action.type === "type" && action.selector) {
+                    const inputs = Array.from(
+                      document.querySelectorAll(action.selector),
+                    ) as HTMLInputElement[]
+                    inputs.forEach((i) => {
+                      i.value = action.value || ""
+                      i.dispatchEvent(new Event("input", { bubbles: true }))
+                    })
+                  }
+                } catch (e) {}
+              }
             }
           }
-          if (schema.some((c: any) => c.clickSelector)) await sleep(600)
+
+          if (schema.some((c: any) => c.actions && c.actions.length > 0))
+            await sleep(800) // Global render wait
 
           let maxRows = 0
           const columnData = schema.map((col: any) => {
@@ -290,7 +323,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ status: "error", message: String(error) })
       }
     })()
-    return true // Keep message channel open for async response
+    return true
   }
 
   if (request.action === "CLICK_NEXT") {

@@ -5,12 +5,15 @@ import {
   Bookmark,
   BoxSelect,
   Check,
+  Clock,
   Download,
   ExternalLink,
+  Keyboard,
   Layers,
   Link2,
   MousePointer2,
   MousePointerClick,
+  Plus,
   Save,
   Settings,
   Square,
@@ -30,6 +33,14 @@ import {
   SelectValue,
 } from "./components/ui/select"
 
+// --- NEW DATA STRUCTURES ---
+interface ScrapeAction {
+  id: string
+  type: "click" | "wait" | "type"
+  selector?: string
+  value?: string
+}
+
 interface ScrapedNode {
   id: string
   selector: string
@@ -37,7 +48,7 @@ interface ScrapedNode {
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
-  clickSelector?: string
+  actions?: ScrapeAction[] // Replaced clickSelector with robust array
 }
 
 type NavMode = "none" | "next" | "loadMore" | "infinite"
@@ -97,7 +108,11 @@ function App() {
   >("column")
 
   const targetSchemaRef = useRef<"surface" | "deep">("surface")
-  const activeClickActionIdRef = useRef<string | null>(null)
+  // Holds both ColID and ActionID to route DOM selectors properly
+  const activeActionTargetRef = useRef<{
+    colId: string
+    actionId: string
+  } | null>(null)
 
   const [isScraping, setIsScraping] = useState(false)
   const [statusText, setStatusText] = useState("")
@@ -125,7 +140,6 @@ function App() {
   const [recipes, setRecipes] = useState<Record<string, Recipe[]>>({})
   const [suggestedRecipe, setSuggestedRecipe] = useState<Recipe | null>(null)
 
-  // Modals & Refs
   const [showRecipeManager, setShowRecipeManager] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -141,8 +155,6 @@ function App() {
         try {
           const domain = new URL(tab.url).hostname.replace("www.", "")
           setActiveDomain(domain)
-
-          // Load Recipes and Settings
           chrome.storage.local.get(
             ["scrapy_recipes", "scrapy_settings"],
             (result) => {
@@ -151,13 +163,11 @@ function App() {
                 if (
                   result.scrapy_recipes[domain] &&
                   result.scrapy_recipes[domain].length > 0
-                ) {
+                )
                   setSuggestedRecipe(result.scrapy_recipes[domain][0])
-                }
               }
-              if (result.scrapy_settings?.defaultExportFormat) {
+              if (result.scrapy_settings?.defaultExportFormat)
                 setExportFormat(result.scrapy_settings.defaultExportFormat)
-              }
             },
           )
         } catch (e) {}
@@ -175,6 +185,7 @@ function App() {
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
+          actions: [],
         }
         if (targetSchemaRef.current === "surface")
           setScrapedNodes((prev) => [...prev, newNode])
@@ -183,27 +194,29 @@ function App() {
 
       if (
         message.action === "ACTION_SELECTED" &&
-        activeClickActionIdRef.current
+        activeActionTargetRef.current
       ) {
         setIsSelecting(false)
-        const colId = activeClickActionIdRef.current
-        if (targetSchemaRef.current === "surface")
-          setScrapedNodes((prev) =>
-            prev.map((n) =>
-              n.id === colId
-                ? { ...n, clickSelector: message.payload.selector }
-                : n,
-            ),
-          )
-        else
-          setDeepNodes((prev) =>
-            prev.map((n) =>
-              n.id === colId
-                ? { ...n, clickSelector: message.payload.selector }
-                : n,
-            ),
-          )
-        activeClickActionIdRef.current = null
+        const { colId, actionId } = activeActionTargetRef.current
+        const setNodes =
+          targetSchemaRef.current === "surface" ? setScrapedNodes : setDeepNodes
+
+        setNodes((prev) =>
+          prev.map((n) =>
+            n.id === colId
+              ? {
+                  ...n,
+                  actions: n.actions?.map((a) =>
+                    a.id === actionId
+                      ? { ...a, selector: message.payload.selector }
+                      : a,
+                  ),
+                }
+              : n,
+          ),
+        )
+
+        activeActionTargetRef.current = null
         setSelectionMode("column")
       }
 
@@ -222,7 +235,6 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
   }, [])
 
-  // --- SETTINGS MANAGEMENT ---
   const saveSettings = (format: "csv" | "json") => {
     setExportFormat(format)
     chrome.storage.local.set({
@@ -230,14 +242,12 @@ function App() {
     })
   }
 
-  // --- RECIPE MANAGEMENT ---
   const handleSaveRecipe = () => {
     const recipeName = prompt(
       "Enter a name for this template:",
       `${activeDomain} template`,
     )
     if (!recipeName) return
-
     const newRecipe: Recipe = {
       id: crypto.randomUUID(),
       domain: activeDomain,
@@ -249,11 +259,9 @@ function App() {
       pagination: paginationSelector,
       deepLinkColumn: deepLinkColumn,
     }
-
     const updatedRecipes = { ...recipes }
     if (!updatedRecipes[activeDomain]) updatedRecipes[activeDomain] = []
     updatedRecipes[activeDomain].push(newRecipe)
-
     chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
       setRecipes(updatedRecipes)
       alert("Recipe Saved!")
@@ -263,9 +271,8 @@ function App() {
   const loadRecipe = (recipe: Recipe) => {
     setScrapedNodes(recipe.schema)
     setContainerSelector(recipe.container)
-    setNavMode(recipe.navMode || (recipe.pagination ? "next" : "none"))
+    setNavMode(recipe.navMode || "none")
     setPaginationSelector(recipe.pagination)
-
     if (recipe.deepSchema && recipe.deepSchema.length > 0) {
       setIsDeepScrapeEnabled(true)
       setDeepNodes(recipe.deepSchema)
@@ -302,48 +309,37 @@ function App() {
   const importRecipes = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) return
-
     const reader = new FileReader()
     reader.onload = (e) => {
       try {
         const importedData = JSON.parse(e.target?.result as string)
         const mergedRecipes = { ...recipes }
-
-        // Smart merge: prevent duplicate IDs
         for (const domain in importedData) {
           if (!mergedRecipes[domain]) mergedRecipes[domain] = []
           importedData[domain].forEach((importedRecipe: Recipe) => {
-            if (
-              !mergedRecipes[domain].some((r) => r.id === importedRecipe.id)
-            ) {
+            if (!mergedRecipes[domain].some((r) => r.id === importedRecipe.id))
               mergedRecipes[domain].push(importedRecipe)
-            }
           })
         }
-
         chrome.storage.local.set({ scrapy_recipes: mergedRecipes }, () => {
           setRecipes(mergedRecipes)
-          alert("Recipes imported and merged successfully!")
+          alert("Recipes imported!")
         })
       } catch (err) {
-        alert(
-          "Failed to parse JSON file. Make sure it's a valid Scrapy backup.",
-        )
+        alert("Failed to parse JSON file.")
       }
     }
     reader.readAsText(file)
-    // Reset input
     if (fileInputRef.current) fileInputRef.current.value = ""
   }
 
-  // --- SCRAPER ENGINE ---
   const toggleScraper = async (
     mode: "column" | "pagination" | "container" | "clickAction",
     target: "surface" | "deep" = "surface",
-    colId?: string,
+    targetData?: { colId: string; actionId: string },
   ) => {
     targetSchemaRef.current = target
-    activeClickActionIdRef.current = colId || null
+    activeActionTargetRef.current = targetData || null
     try {
       const [tab] = await chrome.tabs.query({
         active: true,
@@ -429,13 +425,11 @@ function App() {
       await navigateAndWait(workerTabId, startUrl)
       chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
 
-      // PHASE 1: SURFACE SCRAPE
       while (keepScraping) {
         if (abortController.current) {
           setStatusText("Aborted.")
           break
         }
-
         setStatusText(`Scrolling Surface Page ${currentPage}...`)
         await new Promise((resolve) =>
           chrome.tabs.sendMessage(
@@ -447,7 +441,7 @@ function App() {
         await randomSleep(800, 1500)
 
         setStatusText(`Extracting Surface Data ${currentPage}...`)
-        const scrapeRes: any = await new Promise((resolve) => {
+        const scrapeRes: any = await new Promise((resolve) =>
           chrome.tabs.sendMessage(
             workerTabId,
             {
@@ -455,18 +449,18 @@ function App() {
               payload: { schema: scrapedNodes, containerSelector },
             },
             resolve,
-          )
-        })
-
-        if (scrapeRes?.status === "success" && scrapeRes.data) {
+          ),
+        )
+        if (scrapeRes?.status === "success" && scrapeRes.data)
           allData = [...allData, ...scrapeRes.data]
-        } else {
-          break
-        }
+        else break
 
-        if (abortController.current) break
-        if (navMode === "none") break
-        if (pageLimitMode === "custom" && currentPage >= maxPages) break
+        if (
+          abortController.current ||
+          navMode === "none" ||
+          (pageLimitMode === "custom" && currentPage >= maxPages)
+        )
+          break
 
         if (navMode === "infinite") {
           setStatusText(`Loading more via Scroll...`)
@@ -508,13 +502,11 @@ function App() {
         }
       }
 
-      // DEDUPLICATION
       setStatusText(`Deduplicating rows...`)
       allData = Array.from(new Set(allData.map((a) => JSON.stringify(a)))).map(
         (a) => JSON.parse(a),
       )
 
-      // PHASE 2: DEEP SCRAPE
       if (
         !abortController.current &&
         isDeepScrapeEnabled &&
@@ -526,7 +518,6 @@ function App() {
             setStatusText("Deep Scrape Aborted.")
             break
           }
-
           const targetUrl = allData[i][deepLinkColumn]
           if (
             !targetUrl ||
@@ -541,34 +532,30 @@ function App() {
             `Deep Scraping Profile ${i + 1} of ${allData.length}...`,
           )
           const loadSuccess = await navigateAndWait(workerTabId, targetUrl)
-
           if (!loadSuccess) {
             allData[i]["_deep_scrape_status"] = "Timeout"
             continue
           }
 
-          const deepRes: any = await new Promise((resolve) => {
+          const deepRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
               { action: "EXECUTE_SCRAPE", payload: { schema: deepNodes } },
               resolve,
-            )
-          })
-
+            ),
+          )
           if (
             deepRes?.status === "success" &&
             deepRes.data &&
             deepRes.data.length > 0
-          ) {
+          )
             allData[i] = { ...allData[i], ...deepRes.data[0] }
-          } else {
-            allData[i]["_deep_scrape_status"] = "Failed Extraction"
-          }
+          else allData[i]["_deep_scrape_status"] = "Failed Extraction"
+
           await randomSleep(2000, 4000)
         }
       }
 
-      // PHASE 3: FINALIZATION
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
       if (allData.length > 0) {
         let blob: Blob
@@ -603,6 +590,64 @@ function App() {
     }
   }
 
+  // --- ACTION BUILDER HELPERS ---
+  const addAction = (
+    nodeId: string,
+    type: "click" | "wait" | "type",
+    target: "surface" | "deep",
+  ) => {
+    const newAction: ScrapeAction = {
+      id: crypto.randomUUID(),
+      type,
+      value: type === "wait" ? "500" : "",
+    }
+    const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
+    setNodes((prev) =>
+      prev.map((n) =>
+        n.id === nodeId
+          ? { ...n, actions: [...(n.actions || []), newAction] }
+          : n,
+      ),
+    )
+  }
+
+  const updateAction = (
+    nodeId: string,
+    actionId: string,
+    key: keyof ScrapeAction,
+    value: string,
+    target: "surface" | "deep",
+  ) => {
+    const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
+    setNodes((prev) =>
+      prev.map((n) =>
+        n.id === nodeId
+          ? {
+              ...n,
+              actions: n.actions?.map((a) =>
+                a.id === actionId ? { ...a, [key]: value } : a,
+              ),
+            }
+          : n,
+      ),
+    )
+  }
+
+  const removeAction = (
+    nodeId: string,
+    actionId: string,
+    target: "surface" | "deep",
+  ) => {
+    const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
+    setNodes((prev) =>
+      prev.map((n) =>
+        n.id === nodeId
+          ? { ...n, actions: n.actions?.filter((a) => a.id !== actionId) }
+          : n,
+      ),
+    )
+  }
+
   const renderNodeControls = (
     node: ScrapedNode,
     target: "surface" | "deep",
@@ -611,6 +656,8 @@ function App() {
       node.availableAttributes.find((a) => a.name === node.attribute)
         ?.preview || "No data."
     const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
+    const isNodeActionSelecting =
+      isSelecting && activeActionTargetRef.current?.colId === node.id
 
     return (
       <div
@@ -680,7 +727,7 @@ function App() {
           </Select>
         </div>
 
-        <div className="bg-black/20 rounded-md p-2 border border-border/20 mb-2">
+        <div className="bg-black/20 rounded-md p-2 border border-border/20 mb-3">
           <p
             className="text-[10px] text-muted-foreground font-mono truncate"
             title={activePreview}
@@ -689,45 +736,164 @@ function App() {
           </p>
         </div>
 
-        <div className="pt-2 border-t border-border/50">
-          {node.clickSelector ? (
-            <div className="flex items-center justify-between bg-rose-950/20 px-2 py-1.5 rounded border border-rose-900/30">
-              <div className="flex items-center gap-1.5 overflow-hidden">
-                <MousePointerClick className="w-3 h-3 text-rose-500 shrink-0" />
-                <span
-                  className="text-[10px] text-rose-400 font-mono truncate"
-                  title={node.clickSelector}
-                >
-                  {node.clickSelector}
-                </span>
-              </div>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="w-5 h-5 ml-2 hover:bg-rose-950/50"
-                onClick={() =>
-                  setNodes((prev) =>
-                    prev.map((n) =>
-                      n.id === node.id ? { ...n, clickSelector: undefined } : n,
-                    ),
-                  )
-                }
-              >
-                <X className="w-3 h-3 text-rose-400" />
-              </Button>
-            </div>
-          ) : (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => toggleScraper("clickAction", target, node.id)}
-              className={`text-[10px] h-6 px-2 w-full justify-start ${isSelecting && activeClickActionIdRef.current === node.id ? "bg-rose-500/10 text-rose-400" : "text-muted-foreground hover:text-rose-400"}`}
+        {/* --- ACTION BUILDER UI --- */}
+        <div className="pt-2 border-t border-border/50 space-y-2">
+          <div className="flex items-center justify-between">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Pre-Scrape Actions
+            </Label>
+            <Select
+              onValueChange={(val: any) => addAction(node.id, val, target)}
+              value=""
             >
-              {isSelecting && activeClickActionIdRef.current === node.id
-                ? "Select target on page..."
-                : "+ Pre-Scrape Click"}
-            </Button>
-          )}
+              <SelectTrigger className="h-6 w-24 text-[10px] bg-background border-none shadow-none">
+                <span className="flex items-center gap-1">
+                  <Plus className="w-3 h-3" /> Action
+                </span>
+              </SelectTrigger>
+              <SelectContent className="border-border">
+                <SelectItem
+                  value="click"
+                  className="text-xs flex items-center gap-2"
+                >
+                  <MousePointerClick className="w-3 h-3 inline mr-1 text-rose-500" />{" "}
+                  Click
+                </SelectItem>
+                <SelectItem
+                  value="type"
+                  className="text-xs flex items-center gap-2"
+                >
+                  <Keyboard className="w-3 h-3 inline mr-1 text-blue-500" />{" "}
+                  Type Text
+                </SelectItem>
+                <SelectItem
+                  value="wait"
+                  className="text-xs flex items-center gap-2"
+                >
+                  <Clock className="w-3 h-3 inline mr-1 text-amber-500" /> Wait
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="space-y-2">
+            {(node.actions || []).map((action) => {
+              const isThisActionSelecting =
+                isNodeActionSelecting &&
+                activeActionTargetRef.current?.actionId === action.id
+
+              return (
+                <div
+                  key={action.id}
+                  className="flex flex-col gap-1.5 bg-background/50 p-2 rounded border border-border/40 relative group/action"
+                >
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="absolute top-1 right-1 w-4 h-4 text-muted-foreground hover:text-destructive opacity-0 group-hover/action:opacity-100"
+                    onClick={() => removeAction(node.id, action.id, target)}
+                  >
+                    <X className="w-3 h-3" />
+                  </Button>
+
+                  <div className="flex items-center gap-1.5">
+                    {action.type === "click" && (
+                      <MousePointerClick className="w-3 h-3 text-rose-500" />
+                    )}
+                    {action.type === "wait" && (
+                      <Clock className="w-3 h-3 text-amber-500" />
+                    )}
+                    {action.type === "type" && (
+                      <Keyboard className="w-3 h-3 text-blue-500" />
+                    )}
+                    <span className="text-[10px] uppercase font-semibold text-muted-foreground">
+                      {action.type}
+                    </span>
+                  </div>
+
+                  {action.type === "wait" ? (
+                    <div className="flex items-center gap-2 mt-1">
+                      <Input
+                        type="number"
+                        value={action.value}
+                        onChange={(e) =>
+                          updateAction(
+                            node.id,
+                            action.id,
+                            "value",
+                            e.target.value,
+                            target,
+                          )
+                        }
+                        className="h-6 text-[10px] w-20 bg-background"
+                      />{" "}
+                      <span className="text-[10px] text-muted-foreground">
+                        ms
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5 mt-1 pr-4">
+                      {action.selector ? (
+                        <div className="flex items-center gap-1">
+                          <span
+                            className="text-[10px] font-mono text-muted-foreground truncate flex-1 block"
+                            title={action.selector}
+                          >
+                            {action.selector}
+                          </span>
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="w-4 h-4 shrink-0"
+                            onClick={() =>
+                              toggleScraper("clickAction", target, {
+                                colId: node.id,
+                                actionId: action.id,
+                              })
+                            }
+                          >
+                            <MousePointer2 className="w-3 h-3 hover:text-primary" />
+                          </Button>
+                        </div>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className={`h-6 text-[10px] w-full border-dashed ${isThisActionSelecting ? "border-rose-500 text-rose-500 bg-rose-500/10" : ""}`}
+                          onClick={() =>
+                            toggleScraper("clickAction", target, {
+                              colId: node.id,
+                              actionId: action.id,
+                            })
+                          }
+                        >
+                          {isThisActionSelecting
+                            ? "Select target on page..."
+                            : "Select DOM Element"}
+                        </Button>
+                      )}
+                      {action.type === "type" && (
+                        <Input
+                          placeholder="Enter text to type..."
+                          value={action.value}
+                          onChange={(e) =>
+                            updateAction(
+                              node.id,
+                              action.id,
+                              "value",
+                              e.target.value,
+                              target,
+                            )
+                          }
+                          className="h-6 text-[10px] bg-background"
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
         </div>
       </div>
     )
@@ -735,7 +901,6 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* GLOBAL SETTINGS MODAL */}
       {showSettings && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
@@ -764,24 +929,15 @@ function App() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="border-border">
-                  <SelectItem value="json">
-                    .JSON (Best for APIs/n8n)
-                  </SelectItem>
-                  <SelectItem value="csv">
-                    .CSV (Best for Spreadsheets)
-                  </SelectItem>
+                  <SelectItem value="json">.JSON (APIs/n8n)</SelectItem>
+                  <SelectItem value="csv">.CSV (Spreadsheets)</SelectItem>
                 </SelectContent>
               </Select>
-              <p className="text-[10px] text-muted-foreground leading-relaxed">
-                This format will be selected by default when you open the
-                extension. You can still change it per-scrape before executing.
-              </p>
             </div>
           </div>
         </div>
       )}
 
-      {/* RECIPE MANAGER OVERLAY */}
       {showRecipeManager && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
@@ -798,7 +954,6 @@ function App() {
             </Button>
           </header>
 
-          {/* Import/Export Actions */}
           <div className="px-4 py-3 border-b border-border/30 bg-secondary/5 flex gap-2">
             <Button
               onClick={exportAllRecipes}
@@ -951,7 +1106,6 @@ function App() {
               Surface Data (List Page)
             </h2>
           </div>
-
           <div className="space-y-2">
             <Label className="text-xs text-muted-foreground">
               Row Container
@@ -983,7 +1137,6 @@ function App() {
               </div>
             </Button>
           </div>
-
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label className="text-xs text-muted-foreground">Columns</Label>
@@ -1032,7 +1185,6 @@ function App() {
               />
             </div>
           </div>
-
           {isDeepScrapeEnabled && (
             <div className="p-4 bg-indigo-950/10 border border-indigo-900/30 rounded-xl space-y-4 animate-in fade-in slide-in-from-top-2">
               <div className="space-y-1.5">
@@ -1064,7 +1216,6 @@ function App() {
                   </SelectContent>
                 </Select>
               </div>
-
               <div className="space-y-2 pt-2 border-t border-indigo-900/20">
                 <div className="flex items-center justify-between">
                   <Label className="text-xs text-indigo-300">
@@ -1099,7 +1250,6 @@ function App() {
               Navigation & Pagination
             </h2>
           </div>
-
           <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-4">
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">Mode</Label>
@@ -1142,7 +1292,6 @@ function App() {
                 </SelectContent>
               </Select>
             </div>
-
             {(navMode === "next" || navMode === "loadMore") && (
               <div className="space-y-1.5 pt-2 border-t border-border/30">
                 <Label className="text-xs text-muted-foreground">
@@ -1161,7 +1310,6 @@ function App() {
                 </Button>
               </div>
             )}
-
             {navMode !== "none" && (
               <div className="space-y-2 pt-2 border-t border-border/30">
                 <div className="flex items-center justify-between">
