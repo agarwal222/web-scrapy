@@ -1,14 +1,11 @@
 import {
-  AlertCircle,
-  ArrowRightToLine,
-  Bookmark,
   BoxSelect,
   Check,
-  Columns3,
+  Layers,
+  Link2,
   MousePointer2,
+  MousePointerClick,
   Play,
-  Rows4,
-  Save,
   Square,
   Trash2,
   X,
@@ -32,6 +29,7 @@ interface ScrapedNode {
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
+  clickSelector?: string
 }
 
 interface Recipe {
@@ -39,38 +37,67 @@ interface Recipe {
   domain: string
   name: string
   schema: ScrapedNode[]
+  deepSchema: ScrapedNode[]
   container: string | null
   pagination: string | null
+  deepLinkColumn: string | null
 }
 
-interface RecoveryState {
-  domain: string
-  url: string
-  schema: ScrapedNode[]
-  container: string | null
-  pagination: string | null
-  allData: any[]
-  currentPage: number
-}
+const randomSleep = (min: number, max: number) =>
+  new Promise((resolve) =>
+    setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min),
+  )
 
-const randomSleep = (min: number, max: number) => {
-  const delay = Math.floor(Math.random() * (max - min + 1)) + min
-  return new Promise((resolve) => setTimeout(resolve, delay))
+// Safe navigation wrapper to ensure the page loads before we scrape
+const navigateAndWait = (tabId: number, url: string, timeoutMs = 15000) => {
+  return new Promise<boolean>((resolve) => {
+    let resolved = false
+
+    const listener = (
+      updatedTabId: number,
+      info: chrome.tabs.TabChangeInfo,
+    ) => {
+      if (updatedTabId === tabId && info.status === "complete") {
+        if (!resolved) {
+          resolved = true
+          chrome.tabs.onUpdated.removeListener(listener)
+          setTimeout(() => resolve(true), 2500) // Give JS frameworks time to render
+        }
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener)
+    chrome.tabs.update(tabId, { url })
+
+    // Fallback if page gets stuck loading
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true
+        chrome.tabs.onUpdated.removeListener(listener)
+        resolve(false)
+      }
+    }, timeoutMs)
+  })
 }
 
 function App() {
-  // FORCE DARK MODE
   useEffect(() => {
     document.documentElement.classList.add("dark")
   }, [])
 
   const [isSelecting, setIsSelecting] = useState(false)
   const [selectionMode, setSelectionMode] = useState<
-    "column" | "pagination" | "container"
+    "column" | "pagination" | "container" | "clickAction"
   >("column")
-  const [isScraping, setIsScraping] = useState(false)
 
-  // Core Data Schema
+  // Selection Routing Refs
+  const targetSchemaRef = useRef<"surface" | "deep">("surface")
+  const activeClickActionIdRef = useRef<string | null>(null)
+
+  const [isScraping, setIsScraping] = useState(false)
+  const [statusText, setStatusText] = useState("")
+
+  // Surface State
   const [scrapedNodes, setScrapedNodes] = useState<ScrapedNode[]>([])
   const [containerSelector, setContainerSelector] = useState<string | null>(
     null,
@@ -80,22 +107,20 @@ function App() {
     null,
   )
 
-  // Settings
+  // Deep Scrape State
+  const [isDeepScrapeEnabled, setIsDeepScrapeEnabled] = useState(false)
+  const [deepNodes, setDeepNodes] = useState<ScrapedNode[]>([])
+  const [deepLinkColumn, setDeepLinkColumn] = useState<string>("")
+
   const [pageLimitMode, setPageLimitMode] = useState<"custom" | "all">("custom")
   const [maxPages, setMaxPages] = useState<number>(3)
   const [exportFormat, setExportFormat] = useState<"csv" | "json">("json")
-  const [statusText, setStatusText] = useState("")
 
-  // Feature State: Persistence & Automation
   const [activeDomain, setActiveDomain] = useState<string>("")
   const [recipes, setRecipes] = useState<Record<string, Recipe[]>>({})
-  const [suggestedRecipe, setSuggestedRecipe] = useState<Recipe | null>(null)
-  const [showRecipeManager, setShowRecipeManager] = useState(false)
-  const [recoveryData, setRecoveryData] = useState<RecoveryState | null>(null)
 
   const abortController = useRef(false)
 
-  // Initialization: Check Storage & Active Tab
   useEffect(() => {
     const init = async () => {
       const [tab] = await chrome.tabs.query({
@@ -104,32 +129,11 @@ function App() {
       })
       if (tab?.url) {
         try {
-          const urlObj = new URL(tab.url)
-          const domain = urlObj.hostname.replace("www.", "")
-          setActiveDomain(domain)
-
-          // Fetch Recipes & Recovery State
-          chrome.storage.local.get(
-            ["scrapy_recipes", "scrapy_recovery"],
-            (result) => {
-              if (result.scrapy_recipes) {
-                setRecipes(result.scrapy_recipes)
-                // Check if we have a recipe for this domain
-                if (
-                  result.scrapy_recipes[domain] &&
-                  result.scrapy_recipes[domain].length > 0
-                ) {
-                  setSuggestedRecipe(result.scrapy_recipes[domain][0]) // Suggest the first match
-                }
-              }
-              if (result.scrapy_recovery) {
-                setRecoveryData(result.scrapy_recovery)
-              }
-            },
-          )
-        } catch (e) {
-          console.error("Invalid tab URL")
-        }
+          setActiveDomain(new URL(tab.url).hostname.replace("www.", ""))
+        } catch (e) {}
+        chrome.storage.local.get(["scrapy_recipes"], (result) => {
+          if (result.scrapy_recipes) setRecipes(result.scrapy_recipes)
+        })
       }
     }
     init()
@@ -141,12 +145,46 @@ function App() {
           id: crypto.randomUUID(),
           selector: message.payload.selector,
           count: message.payload.count,
-          columnName: `Column ${scrapedNodes.length + 1}`,
+          columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
         }
-        setScrapedNodes((prev) => [...prev, newNode])
+
+        // Route to Surface or Deep schema based on ref
+        if (targetSchemaRef.current === "surface") {
+          setScrapedNodes((prev) => [...prev, newNode])
+        } else {
+          setDeepNodes((prev) => [...prev, newNode])
+        }
       }
+
+      if (
+        message.action === "ACTION_SELECTED" &&
+        activeClickActionIdRef.current
+      ) {
+        setIsSelecting(false)
+        const colId = activeClickActionIdRef.current
+        if (targetSchemaRef.current === "surface") {
+          setScrapedNodes((prev) =>
+            prev.map((n) =>
+              n.id === colId
+                ? { ...n, clickSelector: message.payload.selector }
+                : n,
+            ),
+          )
+        } else {
+          setDeepNodes((prev) =>
+            prev.map((n) =>
+              n.id === colId
+                ? { ...n, clickSelector: message.payload.selector }
+                : n,
+            ),
+          )
+        }
+        activeClickActionIdRef.current = null
+        setSelectionMode("column")
+      }
+
       if (message.action === "PAGINATION_SELECTED") {
         setIsSelecting(false)
         setPaginationSelector(message.payload.selector)
@@ -157,57 +195,19 @@ function App() {
         setContainerCount(message.payload.count)
       }
     }
+
     chrome.runtime.onMessage.addListener(handleMessage)
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
-  }, [scrapedNodes.length])
+  }, [])
 
-  // --- Recipe Management ---
-  const handleSaveRecipe = () => {
-    const recipeName = prompt(
-      "Enter a name for this recipe template:",
-      `${activeDomain} default`,
-    )
-    if (!recipeName) return
+  const toggleScraper = async (
+    mode: "column" | "pagination" | "container" | "clickAction",
+    target: "surface" | "deep" = "surface",
+    colId?: string,
+  ) => {
+    targetSchemaRef.current = target
+    activeClickActionIdRef.current = colId || null
 
-    const newRecipe: Recipe = {
-      id: crypto.randomUUID(),
-      domain: activeDomain,
-      name: recipeName,
-      schema: scrapedNodes,
-      container: containerSelector,
-      pagination: paginationSelector,
-    }
-
-    const updatedRecipes = { ...recipes }
-    if (!updatedRecipes[activeDomain]) updatedRecipes[activeDomain] = []
-    updatedRecipes[activeDomain].push(newRecipe)
-
-    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
-      setRecipes(updatedRecipes)
-      alert("Recipe Saved!")
-    })
-  }
-
-  const loadRecipe = (recipe: Recipe) => {
-    setScrapedNodes(recipe.schema)
-    setContainerSelector(recipe.container)
-    setPaginationSelector(recipe.pagination)
-    setSuggestedRecipe(null)
-    setShowRecipeManager(false)
-  }
-
-  const deleteRecipe = (domain: string, id: string) => {
-    const updatedRecipes = { ...recipes }
-    updatedRecipes[domain] = updatedRecipes[domain].filter((r) => r.id !== id)
-    if (updatedRecipes[domain].length === 0) delete updatedRecipes[domain]
-
-    chrome.storage.local.set({ scrapy_recipes: updatedRecipes }, () => {
-      setRecipes(updatedRecipes)
-    })
-  }
-
-  // --- Core Scraper Engine ---
-  const toggleScraper = async (mode: "column" | "pagination" | "container") => {
     try {
       const [tab] = await chrome.tabs.query({
         active: true,
@@ -231,26 +231,24 @@ function App() {
     }
   }
 
-  const clearSelection = async () => {
+  const clearSelection = () => {
     setScrapedNodes([])
+    setDeepNodes([])
     setPaginationSelector(null)
     setContainerSelector(null)
-    setContainerCount(0)
-    try {
-      const [tab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true,
-      })
-      if (tab?.id)
-        chrome.tabs.sendMessage(tab.id, { action: "CLEAR_SELECTION" })
-    } catch (error) {
-      console.error(error)
-    }
+    setIsDeepScrapeEnabled(false)
+    chrome.tabs
+      .query({ active: true, lastFocusedWindow: true })
+      .then(
+        ([tab]) =>
+          tab?.id &&
+          chrome.tabs.sendMessage(tab.id, { action: "CLEAR_SELECTION" }),
+      )
   }
 
   const convertToCSV = (objArray: any[]) => {
     if (objArray.length === 0) return ""
-    const headers = Object.keys(objArray[0])
+    const headers = Object.keys(Object.assign({}, ...objArray)) // Ensure all dynamic keys are captured
     const rows = [headers.join(",")]
     for (const row of objArray) {
       const values = headers.map(
@@ -262,55 +260,45 @@ function App() {
     return rows.join("\n")
   }
 
-  const handleScrapeAndDownload = async (isResume = false) => {
+  const handleScrapeAndDownload = async () => {
     abortController.current = false
     setIsScraping(true)
-    setSuggestedRecipe(null) // Hide banners when running
-
     let allData: any[] = []
     let currentPage = 1
     const keepScraping = true
-
-    // Handle Resume Setup
-    if (isResume && recoveryData) {
-      allData = recoveryData.allData
-      currentPage = recoveryData.currentPage
-      // Visually restore UI setup
-      setScrapedNodes(recoveryData.schema)
-      setContainerSelector(recoveryData.container)
-      setPaginationSelector(recoveryData.pagination)
-      setRecoveryData(null) // Clear prompt
-    }
 
     try {
       const [initTab] = await chrome.tabs.query({
         active: true,
         lastFocusedWindow: true,
       })
-      if (initTab?.id)
-        chrome.tabs.sendMessage(initTab.id, { action: "BLOCK_UI" })
+      if (!initTab?.id) throw new Error("No active tab found")
+      const baseTabId = initTab.id
 
+      chrome.tabs.sendMessage(baseTabId, { action: "BLOCK_UI" })
+
+      // ==========================================
+      // PHASE 1: SURFACE SCRAPE (LIST PAGES)
+      // ==========================================
       while (keepScraping) {
         if (abortController.current) {
-          setStatusText("Scraping aborted by user.")
+          setStatusText("Aborted.")
           break
         }
 
-        const [tab] = await chrome.tabs.query({
-          active: true,
-          lastFocusedWindow: true,
-        })
-        if (!tab?.id) break
-
-        setStatusText(`Scrolling page ${currentPage}...`)
+        setStatusText(`Scrolling Surface Page ${currentPage}...`)
         await new Promise((resolve) =>
-          chrome.tabs.sendMessage(tab.id!, { action: "SCROLL_PAGE" }, resolve),
+          chrome.tabs.sendMessage(
+            baseTabId,
+            { action: "SCROLL_PAGE" },
+            resolve,
+          ),
         )
 
-        setStatusText(`Extracting data from page ${currentPage}...`)
+        setStatusText(`Extracting Surface Data ${currentPage}...`)
         const scrapeRes: any = await new Promise((resolve) => {
           chrome.tabs.sendMessage(
-            tab.id!,
+            baseTabId,
             {
               action: "EXECUTE_SCRAPE",
               payload: { schema: scrapedNodes, containerSelector },
@@ -321,70 +309,114 @@ function App() {
 
         if (scrapeRes?.status === "success" && scrapeRes.data) {
           allData = [...allData, ...scrapeRes.data]
-
-          // AUTO-RESUME CHECKPOINT: Save state locally after every page
-          await chrome.storage.local.set({
-            scrapy_recovery: {
-              domain: activeDomain,
-              url: tab.url,
-              schema: scrapedNodes,
-              container: containerSelector,
-              pagination: paginationSelector,
-              allData: allData,
-              currentPage: currentPage + 1, // Setup for the next loop if it crashes
-            },
-          })
         } else {
           break
         }
 
         if (abortController.current) break
 
+        // Pagination Check
         if (paginationSelector) {
           if (pageLimitMode === "custom" && currentPage >= maxPages) break
-
           setStatusText(`Clicking next page...`)
-          const clickRes: any = await new Promise((resolve) => {
+          const clickRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
-              tab.id!,
+              baseTabId,
               {
                 action: "CLICK_NEXT",
                 payload: { selector: paginationSelector },
               },
               resolve,
-            )
-          })
-
+            ),
+          )
           if (clickRes?.status !== "success") break
 
-          setStatusText(`Simulating human delay...`)
           await randomSleep(3000, 5000)
           currentPage++
-
-          chrome.tabs.sendMessage(tab.id!, { action: "BLOCK_UI" })
+          chrome.tabs.sendMessage(baseTabId, { action: "BLOCK_UI" })
         } else {
           break
         }
       }
 
-      // GRACEFUL FINISH: Clear recovery data
-      chrome.storage.local.remove(["scrapy_recovery"])
-      setRecoveryData(null)
+      // ==========================================
+      // PHASE 2: DEEP SCRAPE (PROFILE PAGES)
+      // ==========================================
+      if (
+        !abortController.current &&
+        isDeepScrapeEnabled &&
+        deepLinkColumn &&
+        deepNodes.length > 0
+      ) {
+        for (let i = 0; i < allData.length; i++) {
+          if (abortController.current) {
+            setStatusText("Deep Scrape Aborted.")
+            break
+          }
 
+          const targetUrl = allData[i][deepLinkColumn]
+
+          // Validate URL
+          if (
+            !targetUrl ||
+            typeof targetUrl !== "string" ||
+            !targetUrl.startsWith("http")
+          ) {
+            allData[i]["_deep_scrape_status"] = "Invalid URL"
+            continue
+          }
+
+          setStatusText(
+            `Deep Scraping Profile ${i + 1} of ${allData.length}...`,
+          )
+
+          // Navigate Main Tab to the Profile Page & Wait
+          const loadSuccess = await navigateAndWait(baseTabId, targetUrl)
+
+          if (!loadSuccess) {
+            allData[i]["_deep_scrape_status"] = "Timeout"
+            continue
+          }
+
+          // Execute Deep Extraction
+          const deepRes: any = await new Promise((resolve) => {
+            // No container needed for detail pages usually, we scrape the whole page
+            chrome.tabs.sendMessage(
+              baseTabId,
+              { action: "EXECUTE_SCRAPE", payload: { schema: deepNodes } },
+              resolve,
+            )
+          })
+
+          if (
+            deepRes?.status === "success" &&
+            deepRes.data &&
+            deepRes.data.length > 0
+          ) {
+            // Detail pages return 1 row of data. Merge it into our Surface row.
+            allData[i] = { ...allData[i], ...deepRes.data[0] }
+          } else {
+            allData[i]["_deep_scrape_status"] = "Failed Extraction"
+          }
+
+          // Human Jitter to prevent bans
+          await randomSleep(2000, 4500)
+        }
+      }
+
+      // ==========================================
+      // PHASE 3: FINALIZATION
+      // ==========================================
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
-      const [finalTab] = await chrome.tabs.query({
-        active: true,
-        lastFocusedWindow: true,
-      })
-      if (finalTab?.id)
-        chrome.tabs.sendMessage(finalTab.id, { action: "UNBLOCK_UI" })
+      chrome.tabs.sendMessage(baseTabId, { action: "UNBLOCK_UI" })
 
       if (allData.length > 0) {
         let blob: Blob
         let filename: string
         if (exportFormat === "csv") {
-          const csvData = convertToCSV(allData)
-          blob = new Blob([csvData], { type: "text/csv;charset=utf-8;" })
+          blob = new Blob([convertToCSV(allData)], {
+            type: "text/csv;charset=utf-8;",
+          })
           filename = `scrapy_export_${Date.now()}.csv`
         } else {
           blob = new Blob([JSON.stringify(allData, null, 2)], {
@@ -407,374 +439,330 @@ function App() {
     }
   }
 
-  return (
-    <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* Recipe Manager Overlay */}
-      {showRecipeManager && (
-        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
-          <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
-            <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
-              <Bookmark className="w-4 h-4" /> Saved Recipes
-            </h2>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="w-6 h-6 hover:bg-secondary/50"
-              onClick={() => setShowRecipeManager(false)}
-            >
-              <X className="w-4 h-4" />
-            </Button>
-          </header>
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {Object.keys(recipes).length === 0 && (
-              <p className="text-xs text-muted-foreground text-center mt-10">
-                No recipes saved yet.
-              </p>
-            )}
-            {Object.entries(recipes).map(([domain, domainRecipes]) => (
-              <div key={domain} className="space-y-2">
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                  {domain}
-                </p>
-                {domainRecipes.map((recipe) => (
-                  <div
-                    key={recipe.id}
-                    className="flex items-center justify-between p-3 bg-secondary/10 border border-border/30 rounded-lg group"
-                  >
-                    <div>
-                      <p className="text-xs font-medium text-foreground">
-                        {recipe.name}
-                      </p>
-                      <p className="text-[10px] text-muted-foreground">
-                        {recipe.schema.length} columns defined
-                      </p>
-                    </div>
-                    <div className="flex gap-2">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => deleteRecipe(domain, recipe.id)}
-                        className="h-7 text-xs text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        Delete
-                      </Button>
-                      <Button
-                        size="sm"
-                        onClick={() => loadRecipe(recipe)}
-                        className="h-7 text-xs bg-primary text-primary-foreground"
-                      >
-                        Load Template
-                      </Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ))}
+  // Node UI Renderer Helper
+  const renderNodeControls = (
+    node: ScrapedNode,
+    target: "surface" | "deep",
+  ) => {
+    const activePreview =
+      node.availableAttributes.find((a) => a.name === node.attribute)
+        ?.preview || "No data."
+    const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
+
+    return (
+      <div
+        key={node.id}
+        className="p-3.5 bg-secondary/10 rounded-xl border border-border/30 group"
+      >
+        <div className="flex items-start justify-between mb-3">
+          <div className="flex-1 space-y-1">
+            <Input
+              disabled={isScraping}
+              value={node.columnName}
+              onChange={(e) =>
+                setNodes((prev) =>
+                  prev.map((n) =>
+                    n.id === node.id ? { ...n, columnName: e.target.value } : n,
+                  ),
+                )
+              }
+              className="bg-transparent border-transparent hover:border-border focus:border-border h-7 text-sm font-medium px-1 -ml-1 shadow-none rounded-md"
+            />
+            <p className="text-[10px] text-muted-foreground font-mono px-1">
+              {node.count} matches
+            </p>
           </div>
+          <Button
+            disabled={isScraping}
+            onClick={() =>
+              setNodes((prev) => prev.filter((n) => n.id !== node.id))
+            }
+            variant="ghost"
+            size="icon"
+            className="w-6 h-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </Button>
         </div>
-      )}
 
-      {/* Main Header */}
-      <header className="flex items-center justify-between px-4 py-3 border-b border-border/40 shrink-0 bg-background/95 backdrop-blur z-10">
-        <div className="flex items-center gap-2 text-primary">
-          <BoxSelect className="w-4 h-4" />
-          <span className="text-sm font-medium tracking-tight">Web Scrapy</span>
+        <div className="flex items-center gap-2 mb-3">
+          <Label className="text-[10px] uppercase tracking-wider text-muted-foreground w-16 shrink-0">
+            Extract
+          </Label>
+          <Select
+            disabled={isScraping}
+            value={node.attribute}
+            onValueChange={(val) =>
+              setNodes((prev) =>
+                prev.map((n) =>
+                  n.id === node.id ? { ...n, attribute: val } : n,
+                ),
+              )
+            }
+          >
+            <SelectTrigger className="flex-1 h-7 text-xs bg-background border-border/50 shadow-sm capitalize rounded-md">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="border-border">
+              {node.availableAttributes.map((attr) => (
+                <SelectItem
+                  key={attr.name}
+                  value={attr.name}
+                  className="capitalize text-xs"
+                >
+                  {attr.name === "text" ? "Text (Inner)" : attr.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
-        {!isScraping && (
-          <div className="flex items-center gap-1">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowRecipeManager(true)}
-              className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground flex gap-1"
-            >
-              Recipes{" "}
-              <span className="bg-primary/20 text-primary px-1.5 py-0.5 rounded text-[8px]">
-                {Object.values(recipes).flat().length}
-              </span>
-            </Button>
-            {scrapedNodes.length > 0 && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={clearSelection}
-                className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-destructive"
-              >
-                Clear
-              </Button>
-            )}
-          </div>
-        )}
-      </header>
 
-      {/* Main Content Area */}
-      <main className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar">
-        {/* CRITICAL BANNER: Auto-Resume */}
-        {recoveryData && !isScraping && (
-          <div className="p-3.5 bg-amber-950/30 border border-amber-900/50 rounded-lg flex flex-col gap-3 shrink-0 animate-in slide-in-from-top-2">
-            <div className="flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-              <div>
-                <h3 className="text-xs font-semibold text-amber-500">
-                  Unfinished Scrape Detected
-                </h3>
-                <p className="text-[10px] text-amber-500/80 mt-1 leading-tight">
-                  Found{" "}
-                  <strong className="text-amber-400">
-                    {recoveryData.allData.length} items
-                  </strong>{" "}
-                  from <span className="font-mono">{recoveryData.domain}</span>.
-                  It stopped at Page {recoveryData.currentPage - 1}.
-                </p>
-              </div>
-            </div>
-            {activeDomain === recoveryData.domain ? (
-              <div className="flex gap-2">
-                <Button
-                  onClick={() => setRecoveryData(null)}
-                  variant="ghost"
-                  className="flex-1 h-7 text-xs text-amber-500/70 hover:text-amber-400 hover:bg-amber-950/50 border border-amber-900/30"
-                >
-                  Discard Data
-                </Button>
-                <Button
-                  onClick={() => handleScrapeAndDownload(true)}
-                  className="flex-1 h-7 text-xs bg-amber-600 hover:bg-amber-500 text-white border-none"
-                >
-                  Resume from Pg {recoveryData.currentPage}
-                </Button>
-              </div>
-            ) : (
-              <p className="text-[10px] text-amber-400/80 bg-amber-950/50 p-2 rounded text-center border border-amber-900/30">
-                Navigate to{" "}
-                <strong className="text-amber-400 font-mono">
-                  {recoveryData.domain}
-                </strong>{" "}
-                to resume this session.
-              </p>
-            )}
-          </div>
-        )}
+        <div className="bg-black/20 rounded-md p-2 border border-border/20 mb-2">
+          <p
+            className="text-[10px] text-muted-foreground font-mono truncate"
+            title={activePreview}
+          >
+            {activePreview}
+          </p>
+        </div>
 
-        {/* HELPFUL BANNER: Suggested Recipe */}
-        {suggestedRecipe && !isScraping && !recoveryData && (
-          <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg flex items-center justify-between shrink-0 animate-in fade-in">
-            <div className="flex items-center gap-2 text-primary">
-              <Bookmark className="w-4 h-4" />
-              <span className="text-xs font-medium">
-                Found template: {suggestedRecipe.name}
-              </span>
-            </div>
-            <div className="flex gap-1">
+        <div className="pt-2 border-t border-border/50">
+          {node.clickSelector ? (
+            <div className="flex items-center justify-between bg-rose-950/20 px-2 py-1.5 rounded border border-rose-900/30">
+              <div className="flex items-center gap-1.5 overflow-hidden">
+                <MousePointerClick className="w-3 h-3 text-rose-500 shrink-0" />
+                <span
+                  className="text-[10px] text-rose-400 font-mono truncate"
+                  title={node.clickSelector}
+                >
+                  {node.clickSelector}
+                </span>
+              </div>
               <Button
                 size="icon"
                 variant="ghost"
-                className="h-6 w-6 text-primary hover:bg-primary/20"
-                onClick={() => setSuggestedRecipe(null)}
+                className="w-5 h-5 ml-2 hover:bg-rose-950/50"
+                onClick={() =>
+                  setNodes((prev) =>
+                    prev.map((n) =>
+                      n.id === node.id ? { ...n, clickSelector: undefined } : n,
+                    ),
+                  )
+                }
               >
-                <X className="w-3 h-3" />
-              </Button>
-              <Button
-                size="sm"
-                className="h-6 text-[10px] px-2 bg-primary text-primary-foreground"
-                onClick={() => loadRecipe(suggestedRecipe)}
-              >
-                Load
+                <X className="w-3 h-3 text-rose-400" />
               </Button>
             </div>
-          </div>
-        )}
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => toggleScraper("clickAction", target, node.id)}
+              className={`text-[10px] h-6 px-2 w-full justify-start ${isSelecting && activeClickActionIdRef.current === node.id ? "bg-rose-500/10 text-rose-400" : "text-muted-foreground hover:text-rose-400"}`}
+            >
+              {isSelecting && activeClickActionIdRef.current === node.id
+                ? "Select target on page..."
+                : "+ Pre-Scrape Click"}
+            </Button>
+          )}
+        </div>
+      </div>
+    )
+  }
 
-        {/* Step 1: Container Setup */}
-        <section className="space-y-3">
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Rows4 className="w-3.5 h-3.5" />
-            <h2 className="text-xs font-semibold uppercase tracking-wider">
-              1. Row Context
+  return (
+    <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
+      <header className="flex items-center justify-between px-4 py-3 border-b border-border/40 shrink-0 bg-background/95 backdrop-blur z-10">
+        <div className="flex items-center gap-2 text-primary">
+          <BoxSelect className="w-4 h-4" />{" "}
+          <span className="text-sm font-medium tracking-tight">
+            Web Scrapy Engine
+          </span>
+        </div>
+        {!isScraping && scrapedNodes.length > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={clearSelection}
+            className="h-7 text-[10px] uppercase tracking-wider text-muted-foreground hover:text-destructive"
+          >
+            Reset Tool
+          </Button>
+        )}
+      </header>
+
+      <main className="flex-1 overflow-y-auto p-4 space-y-8 custom-scrollbar">
+        {/* Step 1 & 2: Surface Scrape Config */}
+        <section className="space-y-4 pb-4 border-b border-border/40">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold tracking-wide text-foreground">
+              Surface Data (List Page)
             </h2>
           </div>
-          <div className="group relative">
+
+          <div className="space-y-2">
+            <Label className="text-xs text-muted-foreground">
+              Row Container
+            </Label>
             <Button
-              onClick={() => toggleScraper("container")}
+              onClick={() => toggleScraper("container", "surface")}
               disabled={isScraping}
               variant="outline"
-              className={`w-full justify-start h-auto py-3 px-4 border-dashed transition-all ${isSelecting && selectionMode === "container" ? "border-primary text-primary bg-primary/5" : containerSelector ? "border-border/50 border-solid bg-secondary/20" : "border-border/60 hover:border-border hover:bg-secondary/30 text-muted-foreground"}`}
+              className={`w-full justify-start h-auto py-2 px-3 border-dashed ${containerSelector ? "border-solid bg-secondary/20" : ""}`}
             >
               <div className="flex items-center gap-3 w-full">
-                {isSelecting && selectionMode === "container" ? (
-                  <MousePointer2 className="w-4 h-4 animate-pulse" />
-                ) : containerSelector ? (
+                {containerSelector ? (
                   <Check className="w-4 h-4 text-primary" />
                 ) : (
-                  <MousePointer2 className="w-4 h-4" />
+                  <MousePointer2 className="w-4 h-4 text-muted-foreground" />
                 )}
-                <div className="flex flex-col items-start text-left flex-1">
-                  <span className="text-sm font-medium">
-                    {isSelecting && selectionMode === "container"
-                      ? "Select element on page..."
-                      : containerSelector
-                        ? "Row Container Selected"
-                        : "Define Row Container"}
+                <div className="flex flex-col items-start flex-1">
+                  <span className="text-xs">
+                    {containerSelector
+                      ? "Container Locked"
+                      : "Select List Item Container"}
                   </span>
                   {containerSelector && (
-                    <span className="text-[10px] text-muted-foreground font-mono mt-0.5 truncate max-w-[200px]">
-                      {containerCount} matching rows found
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      {containerCount} rows detected
                     </span>
                   )}
                 </div>
               </div>
             </Button>
           </div>
-        </section>
 
-        {/* Step 2: Data Columns */}
-        <section className="space-y-3">
-          <div className="flex items-center justify-between text-muted-foreground">
-            <div className="flex items-center gap-2">
-              <Columns3 className="w-3.5 h-3.5" />
-              <h2 className="text-xs font-semibold uppercase tracking-wider">
-                2. Data Extractors
-              </h2>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs text-muted-foreground">Columns</Label>
+              <Button
+                onClick={() => toggleScraper("column", "surface")}
+                disabled={isScraping}
+                variant="ghost"
+                size="sm"
+                className="h-6 text-[10px]"
+              >
+                + Add Column
+              </Button>
             </div>
-            <Button
-              onClick={() => toggleScraper("column")}
-              disabled={
-                isScraping || (isSelecting && selectionMode !== "column")
-              }
-              variant="ghost"
-              size="sm"
-              className={`h-7 text-xs transition-colors ${isSelecting && selectionMode === "column" ? "text-primary bg-primary/10" : ""}`}
-            >
-              {isSelecting && selectionMode === "column"
-                ? "Cancel"
-                : "+ Add Column"}
-            </Button>
-          </div>
-
-          <div className="space-y-3">
-            {scrapedNodes.length === 0 && !isSelecting && (
-              <div className="text-center py-6 border border-dashed border-border/40 rounded-lg text-muted-foreground text-xs">
-                No columns defined.
-              </div>
-            )}
-
-            {scrapedNodes.map((node) => {
-              const activePreview =
-                node.availableAttributes.find((a) => a.name === node.attribute)
-                  ?.preview || "No data."
-              return (
-                <div
-                  key={node.id}
-                  className="p-3.5 bg-secondary/10 rounded-xl border border-border/30 group"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex-1 space-y-1">
-                      <Input
-                        disabled={isScraping}
-                        value={node.columnName}
-                        onChange={(e) =>
-                          setScrapedNodes((prev) =>
-                            prev.map((n) =>
-                              n.id === node.id
-                                ? { ...n, columnName: e.target.value }
-                                : n,
-                            ),
-                          )
-                        }
-                        className="bg-transparent border-transparent hover:border-border focus:border-border h-7 text-sm font-medium px-1 -ml-1 shadow-none rounded-md"
-                      />
-                      <p className="text-[10px] text-muted-foreground font-mono px-1">
-                        {node.count} matches
-                      </p>
-                    </div>
-                    <Button
-                      disabled={isScraping}
-                      onClick={() =>
-                        setScrapedNodes((prev) =>
-                          prev.filter((n) => n.id !== node.id),
-                        )
-                      }
-                      variant="ghost"
-                      size="icon"
-                      className="w-6 h-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </Button>
-                  </div>
-                  <div className="flex items-center gap-2 mb-3">
-                    <Label className="text-[10px] uppercase tracking-wider text-muted-foreground w-16 shrink-0">
-                      Extract
-                    </Label>
-                    <Select
-                      disabled={isScraping}
-                      value={node.attribute}
-                      onValueChange={(val) =>
-                        setScrapedNodes((prev) =>
-                          prev.map((n) =>
-                            n.id === node.id ? { ...n, attribute: val } : n,
-                          ),
-                        )
-                      }
-                    >
-                      <SelectTrigger className="flex-1 h-7 text-xs bg-background border-border/50 shadow-sm capitalize rounded-md">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent className="border-border">
-                        {node.availableAttributes.map((attr) => (
-                          <SelectItem
-                            key={attr.name}
-                            value={attr.name}
-                            className="capitalize text-xs"
-                          >
-                            {attr.name === "text" ? "Text (Inner)" : attr.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="bg-black/20 rounded-md p-2 border border-border/20">
-                    <p
-                      className="text-[10px] text-muted-foreground font-mono truncate"
-                      title={activePreview}
-                    >
-                      {activePreview}
-                    </p>
-                  </div>
+            <div className="space-y-3">
+              {scrapedNodes.length === 0 && (
+                <div className="text-center py-4 border border-dashed border-border/40 rounded-lg text-muted-foreground text-xs">
+                  No columns defined.
                 </div>
-              )
-            })}
+              )}
+              {scrapedNodes.map((node) => renderNodeControls(node, "surface"))}
+            </div>
           </div>
         </section>
 
-        {/* Step 3: Automation/Pagination */}
-        <section className="space-y-3">
-          <div className="flex items-center justify-between text-muted-foreground">
+        {/* Step 3: Deep Scrape Config */}
+        <section className="space-y-4 pb-4 border-b border-border/40">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <ArrowRightToLine className="w-3.5 h-3.5" />
-              <h2 className="text-xs font-semibold uppercase tracking-wider">
-                3. Pagination
+              <Layers
+                className={`w-4 h-4 ${isDeepScrapeEnabled ? "text-indigo-400" : "text-muted-foreground"}`}
+              />
+              <h2
+                className={`text-sm font-semibold tracking-wide ${isDeepScrapeEnabled ? "text-indigo-400" : "text-foreground"}`}
+              >
+                Deep Scrape (Profiles)
               </h2>
             </div>
+            <div className="flex items-center space-x-2">
+              <Label className="text-[10px] uppercase text-muted-foreground">
+                Enable
+              </Label>
+              {/* Fallback switch if shadcn switch isn't working/installed properly, but we'll use standard inputs for safety */}
+              <input
+                type="checkbox"
+                checked={isDeepScrapeEnabled}
+                onChange={(e) => setIsDeepScrapeEnabled(e.target.checked)}
+                className="accent-indigo-500 w-4 h-4"
+              />
+            </div>
+          </div>
+
+          {isDeepScrapeEnabled && (
+            <div className="p-4 bg-indigo-950/10 border border-indigo-900/30 rounded-xl space-y-4 animate-in fade-in slide-in-from-top-2">
+              <div className="space-y-1.5">
+                <Label className="text-xs text-indigo-300 flex items-center gap-1.5">
+                  <Link2 className="w-3 h-3" /> Target URL Source
+                </Label>
+                <p className="text-[10px] text-muted-foreground leading-tight">
+                  Select which column from the Surface data contains the link to
+                  the profile page.
+                </p>
+                <Select
+                  disabled={isScraping}
+                  value={deepLinkColumn}
+                  onValueChange={setDeepLinkColumn}
+                >
+                  <SelectTrigger className="w-full h-8 text-xs bg-background border-border/50">
+                    <SelectValue placeholder="Select URL Column..." />
+                  </SelectTrigger>
+                  <SelectContent className="border-border">
+                    {scrapedNodes.map((n) => (
+                      <SelectItem
+                        key={n.id}
+                        value={n.columnName}
+                        className="text-xs"
+                      >
+                        {n.columnName} (Attribute: {n.attribute})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2 pt-2 border-t border-indigo-900/20">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-indigo-300">
+                    Deep Data Extractors
+                  </Label>
+                  <Button
+                    onClick={() => toggleScraper("column", "deep")}
+                    disabled={isScraping}
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 text-[10px] text-indigo-400 hover:text-indigo-300"
+                  >
+                    + Add Detail Column
+                  </Button>
+                </div>
+                <div className="space-y-3">
+                  {deepNodes.length === 0 && (
+                    <div className="text-center py-4 border border-dashed border-indigo-900/40 rounded-lg text-indigo-400/50 text-[10px]">
+                      Navigate to a profile page, then define deep columns here.
+                    </div>
+                  )}
+                  {deepNodes.map((node) => renderNodeControls(node, "deep"))}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* Step 4: Pagination */}
+        <section className="space-y-3">
+          <div className="flex items-center justify-between text-muted-foreground">
+            <h2 className="text-sm font-semibold tracking-wide text-foreground">
+              Pagination
+            </h2>
             <Button
               onClick={() => toggleScraper("pagination")}
-              disabled={
-                isScraping || (isSelecting && selectionMode !== "pagination")
-              }
+              disabled={isScraping}
               variant="ghost"
               size="sm"
-              className={`h-7 text-xs transition-colors ${isSelecting && selectionMode === "pagination" ? "text-primary bg-primary/10" : ""}`}
+              className="h-7 text-xs"
             >
-              {isSelecting && selectionMode === "pagination"
-                ? "Cancel"
-                : paginationSelector
-                  ? "Change Button"
-                  : "+ Set Next Button"}
+              + Set Next Button
             </Button>
           </div>
           {paginationSelector && (
-            <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-3 overflow-hidden">
+            <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium">Scrape Range</span>
+                <span className="text-xs font-medium">Scrape Limit</span>
                 <Select
                   disabled={isScraping}
                   value={pageLimitMode}
@@ -782,12 +770,12 @@ function App() {
                     setPageLimitMode(val)
                   }
                 >
-                  <SelectTrigger className="w-[110px] h-7 text-xs bg-background border-border/50 rounded-md shadow-sm">
+                  <SelectTrigger className="w-[110px] h-7 text-xs bg-background">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent className="border-border">
                     <SelectItem value="custom" className="text-xs">
-                      Set Limit
+                      Custom Range
                     </SelectItem>
                     <SelectItem value="all" className="text-xs">
                       All Pages
@@ -798,14 +786,14 @@ function App() {
               {pageLimitMode === "custom" && (
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-xs text-muted-foreground">
-                    Max Pages
+                    Pages to crawl
                   </span>
                   <Input
                     disabled={isScraping}
                     type="number"
                     value={maxPages}
                     onChange={(e) => setMaxPages(Number(e.target.value))}
-                    className="w-16 h-7 text-xs bg-background border-border/50 rounded-md shadow-sm text-center px-1"
+                    className="w-16 h-7 text-xs bg-background text-center px-1"
                     min={1}
                   />
                 </div>
@@ -818,7 +806,7 @@ function App() {
       {/* Execution Footer */}
       <footer className="px-4 py-4 border-t border-border/40 shrink-0 bg-background/95 backdrop-blur z-10 space-y-3">
         {statusText && (
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground text-center font-medium">
+          <p className="text-[10px] uppercase tracking-wider text-primary text-center font-bold animate-pulse">
             {statusText}
           </p>
         )}
@@ -830,46 +818,34 @@ function App() {
             variant="destructive"
             className="w-full h-10 shadow-sm rounded-lg flex items-center justify-center gap-2"
           >
-            <Square className="w-4 h-4 fill-current" /> Stop & Save
+            <Square className="w-4 h-4 fill-current" /> Emergency Stop
           </Button>
         ) : (
-          <div className="flex flex-col gap-2">
-            {scrapedNodes.length > 0 && (
-              <div className="flex justify-end mb-1">
-                <button
-                  onClick={handleSaveRecipe}
-                  className="text-[10px] text-muted-foreground hover:text-primary flex items-center gap-1 uppercase tracking-wider font-semibold transition-colors"
-                >
-                  <Save className="w-3 h-3" /> Save as Recipe
-                </button>
-              </div>
-            )}
-            <div className="flex gap-2">
-              <Select
-                disabled={scrapedNodes.length === 0}
-                value={exportFormat}
-                onValueChange={(val: "csv" | "json") => setExportFormat(val)}
-              >
-                <SelectTrigger className="w-[85px] h-10 text-xs bg-secondary/50 border-border/50 rounded-lg shadow-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-border min-w-[85px]">
-                  <SelectItem value="json" className="text-xs font-mono">
-                    .JSON
-                  </SelectItem>
-                  <SelectItem value="csv" className="text-xs font-mono">
-                    .CSV
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <Button
-                disabled={scrapedNodes.length === 0}
-                onClick={() => handleScrapeAndDownload(false)}
-                className="flex-1 h-10 rounded-lg shadow-sm font-medium flex items-center justify-center gap-2"
-              >
-                <Play className="w-3.5 h-3.5 fill-current" /> Run Extraction
-              </Button>
-            </div>
+          <div className="flex gap-2">
+            <Select
+              disabled={scrapedNodes.length === 0}
+              value={exportFormat}
+              onValueChange={(val: "csv" | "json") => setExportFormat(val)}
+            >
+              <SelectTrigger className="w-[85px] h-10 text-xs bg-secondary/50 border-border/50 rounded-lg shadow-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="border-border min-w-[85px]">
+                <SelectItem value="json" className="text-xs font-mono">
+                  .JSON
+                </SelectItem>
+                <SelectItem value="csv" className="text-xs font-mono">
+                  .CSV
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <Button
+              disabled={scrapedNodes.length === 0}
+              onClick={() => handleScrapeAndDownload()}
+              className="flex-1 h-10 rounded-lg shadow-sm font-medium flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" /> Execute Workflow
+            </Button>
           </div>
         )}
       </footer>

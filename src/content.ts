@@ -2,42 +2,28 @@
 
 const style = document.createElement("style")
 style.textContent = `
-  .web-scrapy-hover {
-    outline: 2px solid #5e6ad2 !important; 
-    outline-offset: -2px !important;
-    cursor: crosshair !important;
-    background-color: rgba(94, 106, 210, 0.1) !important;
-    transition: all 0.1s ease;
-  }
-  .web-scrapy-selected {
-    outline: 2px dashed #10b981 !important; 
-    outline-offset: -2px !important;
-    background-color: rgba(16, 185, 129, 0.1) !important;
-  }
-  .web-scrapy-pagination-selected {
-    outline: 2px dashed #d946ef !important; 
-    outline-offset: -2px !important;
-    background-color: rgba(217, 70, 239, 0.1) !important;
-  }
-  .web-scrapy-container-selected {
-    outline: 2px dashed #f59e0b !important; /* Amber for containers */
-    outline-offset: -2px !important;
-    background-color: rgba(245, 158, 11, 0.1) !important;
-  }
-  #web-scrapy-glass-shield {
-    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-    z-index: 2147483647; cursor: not-allowed;
-    background: transparent;
-  }
+  .web-scrapy-hover { outline: 2px solid #5e6ad2 !important; outline-offset: -2px !important; cursor: crosshair !important; background-color: rgba(94, 106, 210, 0.1) !important; transition: all 0.1s ease; }
+  .web-scrapy-selected { outline: 2px dashed #10b981 !important; outline-offset: -2px !important; background-color: rgba(16, 185, 129, 0.1) !important; }
+  .web-scrapy-pagination-selected { outline: 2px dashed #d946ef !important; outline-offset: -2px !important; background-color: rgba(217, 70, 239, 0.1) !important; }
+  .web-scrapy-container-selected { outline: 2px dashed #f59e0b !important; outline-offset: -2px !important; background-color: rgba(245, 158, 11, 0.1) !important; }
+  .web-scrapy-action-selected { outline: 2px dashed #e11d48 !important; outline-offset: -2px !important; background-color: rgba(225, 29, 72, 0.1) !important; } /* Rose color for clicks */
+  #web-scrapy-glass-shield { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2147483647; cursor: not-allowed; background: transparent; }
 `
 document.head.appendChild(style)
 
 let isSelecting = false
-let currentSelectionMode: "column" | "pagination" | "container" = "column"
+let currentSelectionMode:
+  | "column"
+  | "pagination"
+  | "container"
+  | "clickAction" = "column"
 let hoveredElement: HTMLElement | null = null
 let selectedElements: HTMLElement[] = []
 let paginationElement: HTMLElement | null = null
 let containerElements: HTMLElement[] = []
+
+// Helper: Async Sleep
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const generateSelector = (el: HTMLElement): string => {
   if (el.id) return `#${el.id}`
@@ -64,9 +50,8 @@ const extractAvailableAttributes = (el: HTMLElement) => {
     attrs.push({ name: "src", preview: el.src.slice(0, 80) })
   Array.from(el.attributes).forEach((attr) => {
     const name = attr.name.toLowerCase()
-    if (!["class", "style", "href", "src"].includes(name)) {
+    if (!["class", "style", "href", "src"].includes(name))
       attrs.push({ name, preview: attr.value.slice(0, 80) })
-    }
   })
   return attrs
 }
@@ -96,7 +81,9 @@ const stopSelection = () => {
   }
 }
 
-const startSelection = (mode: "column" | "pagination" | "container") => {
+const startSelection = (
+  mode: "column" | "pagination" | "container" | "clickAction",
+) => {
   isSelecting = true
   currentSelectionMode = mode
   document.addEventListener("mousemove", handleMouseMove, true)
@@ -117,14 +104,21 @@ const handleClick = (e: MouseEvent) => {
       ) as HTMLElement[]
       matches.forEach((el) => el.classList.add("web-scrapy-selected"))
       selectedElements.push(...matches)
-      const attributesList = extractAvailableAttributes(matches[0])
       chrome.runtime.sendMessage({
         action: "ELEMENTS_SELECTED",
         payload: {
           selector,
           count: matches.length,
-          attributes: attributesList,
+          attributes: extractAvailableAttributes(matches[0]),
         },
+      })
+    } else if (currentSelectionMode === "clickAction") {
+      // Send the selector back, visually highlight it
+      hoveredElement.classList.add("web-scrapy-action-selected")
+      selectedElements.push(hoveredElement)
+      chrome.runtime.sendMessage({
+        action: "ACTION_SELECTED",
+        payload: { selector },
       })
     } else if (currentSelectionMode === "container") {
       containerElements.forEach((el) =>
@@ -155,7 +149,10 @@ const handleClick = (e: MouseEvent) => {
 
 const clearHighlights = () => {
   if (hoveredElement) hoveredElement.classList.remove("web-scrapy-hover")
-  selectedElements.forEach((el) => el.classList.remove("web-scrapy-selected"))
+  selectedElements.forEach((el) => {
+    el.classList.remove("web-scrapy-selected")
+    el.classList.remove("web-scrapy-action-selected")
+  })
   containerElements.forEach((el) =>
     el.classList.remove("web-scrapy-container-selected"),
   )
@@ -192,85 +189,108 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     sendResponse({ status: "success" })
   }
-
   if (request.action === "UNBLOCK_UI") {
     const shield = document.getElementById("web-scrapy-glass-shield")
     if (shield) shield.remove()
     sendResponse({ status: "success" })
   }
-
   if (request.action === "SCROLL_PAGE") {
     window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
     setTimeout(() => sendResponse({ status: "success" }), 1500)
     return true
   }
 
+  // REWRITTEN ENGINE: Asynchronous & Smart Action Fallbacks
   if (request.action === "EXECUTE_SCRAPE") {
-    try {
-      const schema = request.payload.schema
-      const containerSelector = request.payload.containerSelector
-      const scrapedData: any[] = []
+    ;(async () => {
+      try {
+        const schema = request.payload.schema
+        const containerSelector = request.payload.containerSelector
+        const scrapedData: any[] = []
 
-      // BULLETPROOF MODE: Scoped by Row Container
-      if (containerSelector) {
-        const containers = Array.from(
-          document.querySelectorAll(containerSelector),
-        )
+        if (containerSelector) {
+          const containers = Array.from(
+            document.querySelectorAll(containerSelector),
+          )
 
-        containers.forEach((container) => {
-          const rowObj: Record<string, string> = {}
+          for (const container of containers) {
+            const rowObj: Record<string, string> = {}
 
-          schema.forEach((col: any) => {
-            // Find the element INSIDE the current container
-            const el = container.querySelector(col.selector) as HTMLElement
-            let val = ""
-
-            if (el) {
-              if (col.attribute === "text") val = el.innerText.trim()
-              else if (col.attribute === "href")
-                val = (el as HTMLAnchorElement).href || ""
-              else if (col.attribute === "src")
-                val = (el as HTMLImageElement).src || ""
-              else val = el.getAttribute(col.attribute) || ""
+            // 1. SMART EXECUTION: Handle Pre-Scrape Actions First
+            for (const col of schema) {
+              if (col.clickSelector) {
+                const btn = container.querySelector(
+                  col.clickSelector,
+                ) as HTMLElement
+                // If found, click it and wait. If not found, skip gracefully.
+                if (btn) {
+                  btn.click()
+                  await sleep(400) // Wait for the DOM element to reveal data
+                }
+              }
             }
-            rowObj[col.columnName] = val
+
+            // 2. EXTRACTION: Pull the data after actions complete
+            for (const col of schema) {
+              const el = container.querySelector(col.selector) as HTMLElement
+              let val = ""
+              if (el) {
+                if (col.attribute === "text") val = el.innerText.trim()
+                else if (col.attribute === "href")
+                  val = (el as HTMLAnchorElement).href || ""
+                else if (col.attribute === "src")
+                  val = (el as HTMLImageElement).src || ""
+                else val = el.getAttribute(col.attribute) || ""
+              }
+              rowObj[col.columnName] = val
+            }
+            scrapedData.push(rowObj)
+          }
+        } else {
+          // Legacy Mode (No Container)
+          // Pre-scrape globally if needed
+          for (const col of schema) {
+            if (col.clickSelector) {
+              const btns = Array.from(
+                document.querySelectorAll(col.clickSelector),
+              ) as HTMLElement[]
+              btns.forEach((b) => b.click())
+            }
+          }
+          if (schema.some((c: any) => c.clickSelector)) await sleep(600)
+
+          let maxRows = 0
+          const columnData = schema.map((col: any) => {
+            const elements = Array.from(document.querySelectorAll(col.selector))
+            maxRows = Math.max(maxRows, elements.length)
+            return { ...col, elements }
           })
 
-          scrapedData.push(rowObj)
-        })
-      }
-      // LEGACY MODE: Array Zipping (Fallback if no container selected)
-      else {
-        let maxRows = 0
-        const columnData = schema.map((col: any) => {
-          const elements = Array.from(document.querySelectorAll(col.selector))
-          maxRows = Math.max(maxRows, elements.length)
-          return { ...col, elements }
-        })
-
-        for (let i = 0; i < maxRows; i++) {
-          const rowObj: Record<string, string> = {}
-          columnData.forEach((col: any) => {
-            const el = col.elements[i] as HTMLElement
-            let val = ""
-            if (el) {
-              if (col.attribute === "text") val = el.innerText.trim()
-              else if (col.attribute === "href")
-                val = (el as HTMLAnchorElement).href || ""
-              else if (col.attribute === "src")
-                val = (el as HTMLImageElement).src || ""
-              else val = el.getAttribute(col.attribute) || ""
-            }
-            rowObj[col.columnName] = val
-          })
-          scrapedData.push(rowObj)
+          for (let i = 0; i < maxRows; i++) {
+            const rowObj: Record<string, string> = {}
+            columnData.forEach((col: any) => {
+              const el = col.elements[i] as HTMLElement
+              let val = ""
+              if (el) {
+                if (col.attribute === "text") val = el.innerText.trim()
+                else if (col.attribute === "href")
+                  val = (el as HTMLAnchorElement).href || ""
+                else if (col.attribute === "src")
+                  val = (el as HTMLImageElement).src || ""
+                else val = el.getAttribute(col.attribute) || ""
+              }
+              rowObj[col.columnName] = val
+            })
+            scrapedData.push(rowObj)
+          }
         }
-      }
 
-      sendResponse({ status: "success", data: scrapedData })
-    } catch (error) {
-      sendResponse({ status: "error", message: String(error) })
-    }
+        sendResponse({ status: "success", data: scrapedData })
+      } catch (error) {
+        sendResponse({ status: "error", message: String(error) })
+      }
+    })()
+    return true // Keep message channel open for async response
   }
 
   if (request.action === "CLICK_NEXT") {
