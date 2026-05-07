@@ -24,6 +24,7 @@ let containerElements: HTMLElement[] = []
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// 1. Broad Pattern Matcher (Good for lists)
 const generateSelector = (el: HTMLElement): string => {
   if (el.id) return `#${el.id}`
   let selector = el.tagName.toLowerCase()
@@ -35,6 +36,37 @@ const generateSelector = (el: HTMLElement): string => {
     if (classes) selector += `.${classes}`
   }
   return selector
+}
+
+// 2. Strict Exact Matcher (Good for unique profile elements)
+const getExactSelector = (el: HTMLElement): string => {
+  const path: string[] = []
+  let current: HTMLElement | null = el
+
+  while (current && current.nodeType === Node.ELEMENT_NODE) {
+    let selector = current.tagName.toLowerCase()
+    if (selector === "html") {
+      path.unshift(selector)
+      break
+    }
+    if (current.id) {
+      selector += `#${current.id}`
+      path.unshift(selector)
+      break
+    } else {
+      let sibling = current.previousElementSibling
+      let nth = 1
+      while (sibling) {
+        if (sibling.tagName.toLowerCase() === selector) nth++
+        sibling = sibling.previousElementSibling
+      }
+      if (nth > 1 || current.nextElementSibling)
+        selector += `:nth-of-type(${nth})`
+    }
+    path.unshift(selector)
+    current = current.parentElement
+  }
+  return path.join(" > ")
 }
 
 const extractAvailableAttributes = (el: HTMLElement) => {
@@ -95,51 +127,65 @@ const handleClick = (e: MouseEvent) => {
   e.stopPropagation()
 
   if (hoveredElement) {
-    const selector = generateSelector(hoveredElement)
-
     if (currentSelectionMode === "column") {
+      // Calculate both selectors simultaneously
+      const patternSelector = generateSelector(hoveredElement)
+      const exactSelector = getExactSelector(hoveredElement)
+
+      const patternMatches = document.querySelectorAll(patternSelector).length
+      const exactMatches = document.querySelectorAll(exactSelector).length
+
       const matches = Array.from(
-        document.querySelectorAll(selector),
+        document.querySelectorAll(patternSelector),
       ) as HTMLElement[]
       matches.forEach((el) => el.classList.add("web-scrapy-selected"))
       selectedElements.push(...matches)
+
       chrome.runtime.sendMessage({
         action: "ELEMENTS_SELECTED",
         payload: {
-          selector,
-          count: matches.length,
-          attributes: extractAvailableAttributes(matches[0]),
+          patternSelector,
+          exactSelector,
+          patternCount: patternMatches,
+          exactCount: exactMatches,
+          attributes: extractAvailableAttributes(hoveredElement),
         },
       })
-    } else if (currentSelectionMode === "clickAction") {
-      hoveredElement.classList.add("web-scrapy-action-selected")
-      selectedElements.push(hoveredElement)
-      chrome.runtime.sendMessage({
-        action: "ACTION_SELECTED",
-        payload: { selector },
-      })
-    } else if (currentSelectionMode === "container") {
-      containerElements.forEach((el) =>
-        el.classList.remove("web-scrapy-container-selected"),
-      )
-      const matches = Array.from(
-        document.querySelectorAll(selector),
-      ) as HTMLElement[]
-      matches.forEach((el) => el.classList.add("web-scrapy-container-selected"))
-      containerElements = matches
-      chrome.runtime.sendMessage({
-        action: "CONTAINER_SELECTED",
-        payload: { selector, count: matches.length },
-      })
-    } else if (currentSelectionMode === "pagination") {
-      if (paginationElement)
-        paginationElement.classList.remove("web-scrapy-pagination-selected")
-      hoveredElement.classList.add("web-scrapy-pagination-selected")
-      paginationElement = hoveredElement
-      chrome.runtime.sendMessage({
-        action: "PAGINATION_SELECTED",
-        payload: { selector },
-      })
+    } else {
+      // Standard flow for actions, containers, pagination
+      const selector = generateSelector(hoveredElement)
+      if (currentSelectionMode === "clickAction") {
+        hoveredElement.classList.add("web-scrapy-action-selected")
+        selectedElements.push(hoveredElement)
+        chrome.runtime.sendMessage({
+          action: "ACTION_SELECTED",
+          payload: { selector },
+        })
+      } else if (currentSelectionMode === "container") {
+        containerElements.forEach((el) =>
+          el.classList.remove("web-scrapy-container-selected"),
+        )
+        const matches = Array.from(
+          document.querySelectorAll(selector),
+        ) as HTMLElement[]
+        matches.forEach((el) =>
+          el.classList.add("web-scrapy-container-selected"),
+        )
+        containerElements = matches
+        chrome.runtime.sendMessage({
+          action: "CONTAINER_SELECTED",
+          payload: { selector, count: matches.length },
+        })
+      } else if (currentSelectionMode === "pagination") {
+        if (paginationElement)
+          paginationElement.classList.remove("web-scrapy-pagination-selected")
+        hoveredElement.classList.add("web-scrapy-pagination-selected")
+        paginationElement = hoveredElement
+        chrome.runtime.sendMessage({
+          action: "PAGINATION_SELECTED",
+          payload: { selector },
+        })
+      }
     }
     stopSelection()
   }
@@ -213,7 +259,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
 
-            // 1. SMART EXECUTION: Process Action Pipeline Safely
             for (const col of schema) {
               if (col.actions && col.actions.length > 0) {
                 for (const action of col.actions) {
@@ -239,14 +284,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         )
                       }
                     }
-                  } catch (e) {
-                    console.warn("Action skipped safely.")
-                  }
+                  } catch (e) {}
                 }
               }
             }
 
-            // 2. EXTRACTION
             for (const col of schema) {
               const el = container.querySelector(col.selector) as HTMLElement
               let val = ""
@@ -263,7 +305,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             scrapedData.push(rowObj)
           }
         } else {
-          // Legacy Mode (No Container)
           for (const col of schema) {
             if (col.actions && col.actions.length > 0) {
               for (const action of col.actions) {
@@ -290,7 +331,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
 
           if (schema.some((c: any) => c.actions && c.actions.length > 0))
-            await sleep(800) // Global render wait
+            await sleep(800)
 
           let maxRows = 0
           const columnData = schema.map((col: any) => {

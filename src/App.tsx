@@ -42,10 +42,16 @@ interface ScrapeAction {
   value?: string
 }
 
+// UPGRADED SCHEMA: Supports dual-selectors
 interface ScrapedNode {
   id: string
-  selector: string
-  count: number
+  selector: string // The active selector
+  patternSelector: string
+  exactSelector: string
+  count: number // The active count
+  patternCount: number
+  exactCount: number
+  isExact: boolean
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
@@ -116,8 +122,6 @@ function App() {
 
   const [isScraping, setIsScraping] = useState(false)
   const [statusText, setStatusText] = useState("")
-
-  // NEW: Live Data State for Console
   const [liveData, setLiveData] = useState<any[]>([])
 
   const [scrapedNodes, setScrapedNodes] = useState<ScrapedNode[]>([])
@@ -183,8 +187,13 @@ function App() {
         setIsSelecting(false)
         const newNode: ScrapedNode = {
           id: crypto.randomUUID(),
-          selector: message.payload.selector,
-          count: message.payload.count,
+          selector: message.payload.patternSelector,
+          patternSelector: message.payload.patternSelector,
+          exactSelector: message.payload.exactSelector,
+          count: message.payload.patternCount,
+          patternCount: message.payload.patternCount,
+          exactCount: message.payload.exactCount,
+          isExact: false, // Default to pattern matching
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
@@ -203,7 +212,6 @@ function App() {
         const { colId, actionId } = activeActionTargetRef.current
         const setNodes =
           targetSchemaRef.current === "surface" ? setScrapedNodes : setDeepNodes
-
         setNodes((prev) =>
           prev.map((n) =>
             n.id === colId
@@ -218,7 +226,6 @@ function App() {
               : n,
           ),
         )
-
         activeActionTargetRef.current = null
         setSelectionMode("column")
       }
@@ -457,7 +464,7 @@ function App() {
         )
         if (scrapeRes?.status === "success" && scrapeRes.data) {
           currentDataState = [...currentDataState, ...scrapeRes.data]
-          setLiveData([...currentDataState]) // UPDATE LIVE CONSOLE
+          setLiveData([...currentDataState])
         } else {
           break
         }
@@ -558,7 +565,7 @@ function App() {
             deepRes.data.length > 0
           ) {
             currentDataState[i] = { ...currentDataState[i], ...deepRes.data[0] }
-            setLiveData([...currentDataState]) // UPDATE LIVE CONSOLE
+            setLiveData([...currentDataState])
           } else {
             currentDataState[i]["_deep_scrape_status"] = "Failed Extraction"
           }
@@ -685,9 +692,41 @@ function App() {
               }
               className="bg-transparent border-transparent hover:border-border focus:border-border h-7 text-sm font-medium px-1 -ml-1 shadow-none rounded-md"
             />
-            <p className="text-[10px] text-muted-foreground font-mono px-1">
-              {node.count} matches
-            </p>
+            <div className="flex items-center gap-2 px-1">
+              <p className="text-[10px] text-muted-foreground font-mono">
+                {node.count} matches
+              </p>
+              {/* NEW: STRICT EXACT MATCH TOGGLE */}
+              <div className="flex items-center gap-1 opacity-60 hover:opacity-100 transition-opacity">
+                <input
+                  type="checkbox"
+                  checked={node.isExact || false}
+                  onChange={(e) => {
+                    const exact = e.target.checked
+                    setNodes((prev) =>
+                      prev.map((n) =>
+                        n.id === node.id
+                          ? {
+                              ...n,
+                              isExact: exact,
+                              selector: exact
+                                ? n.exactSelector || n.selector
+                                : n.patternSelector || n.selector,
+                              count: exact
+                                ? n.exactCount || n.count
+                                : n.patternCount || n.count,
+                            }
+                          : n,
+                      ),
+                    )
+                  }}
+                  className="accent-primary w-2.5 h-2.5 rounded-sm"
+                />
+                <Label className="text-[9px] text-muted-foreground cursor-pointer uppercase tracking-wider">
+                  Strict Path
+                </Label>
+              </div>
+            </div>
           </div>
           <Button
             disabled={isScraping}
@@ -902,7 +941,6 @@ function App() {
     )
   }
 
-  // Helper to derive table headers dynamically from current schema state
   const getTableHeaders = () => {
     const surfaceHeaders = scrapedNodes.map((n) => n.columnName)
     const deepHeaders = isDeepScrapeEnabled
@@ -1083,7 +1121,6 @@ function App() {
         )}
       </header>
 
-      {/* CONDITIONAL RENDER: SCHEMA BUILDER vs LIVE CONSOLE */}
       {isScraping ? (
         <main className="flex-1 flex flex-col overflow-hidden bg-background">
           <div className="p-4 border-b border-border/40 flex items-center justify-between bg-secondary/5">
@@ -1100,7 +1137,6 @@ function App() {
               </span>
             </div>
           </div>
-
           <div className="flex-1 overflow-auto custom-scrollbar p-4">
             {liveData.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-3 opacity-50">
