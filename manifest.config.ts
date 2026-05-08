@@ -1,0 +1,34 @@
+// manifest.config.js
+import { defineManifest } from "@crxjs/vite-plugin"
+
+export default defineManifest({
+  manifest_version: 3,
+  name: "Web Scrapy",
+  version: "1.0.0",
+  description: "Visual web scraper for data extraction.",
+  permissions: [
+    "activeTab",
+    "scripting",
+    "storage",
+    "unlimitedStorage",
+    "downloads",
+    "sidePanel",
+  ],
+  host_permissions: ["<all_urls>"],
+  background: {
+    service_worker: "src/background.ts",
+    type: "module",
+  },
+  content_scripts: [
+    {
+      matches: ["<all_urls>"],
+      js: ["src/content.ts"],
+    },
+  ],
+  side_panel: {
+    default_path: "index.html",
+  },
+  action: {
+    default_title: "Open Scraper",
+  },
+})
