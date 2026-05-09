@@ -14,6 +14,7 @@ import {
   EyeOff,
   Filter,
   FlaskConical,
+  Ghost,
   Keyboard,
   Layers,
   Link2,
@@ -30,6 +31,7 @@ import {
   Trash2,
   Upload,
   Wand2,
+  Webhook,
   X,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
@@ -172,7 +174,11 @@ function App() {
 
   const [pageLimitMode, setPageLimitMode] = useState<"custom" | "all">("custom")
   const [maxPages, setMaxPages] = useState<number>(3)
+
+  // Global Settings
   const [exportFormat, setExportFormat] = useState<"csv" | "json">("json")
+  const [webhookUrl, setWebhookUrl] = useState<string>("")
+  const [stealthMode, setStealthMode] = useState<boolean>(false)
 
   const [activeDomain, setActiveDomain] = useState<string>("")
   const [recipes, setRecipes] = useState<Record<string, Recipe[]>>({})
@@ -203,8 +209,14 @@ function App() {
                 )
                   setSuggestedRecipe(result.scrapy_recipes[domain][0])
               }
-              if (result.scrapy_settings?.defaultExportFormat)
-                setExportFormat(result.scrapy_settings.defaultExportFormat)
+              if (result.scrapy_settings) {
+                if (result.scrapy_settings.defaultExportFormat)
+                  setExportFormat(result.scrapy_settings.defaultExportFormat)
+                if (result.scrapy_settings.webhookUrl)
+                  setWebhookUrl(result.scrapy_settings.webhookUrl)
+                if (result.scrapy_settings.stealthMode !== undefined)
+                  setStealthMode(result.scrapy_settings.stealthMode)
+              }
               if (
                 result.scrapy_recovery_data &&
                 result.scrapy_recovery_data.length > 0
@@ -219,7 +231,6 @@ function App() {
     init()
 
     const handleMessage = (message: any) => {
-      // Message handling remains identical
       if (message.action === "ELEMENTS_SELECTED") {
         setIsSelecting(false)
         const hasSmartSelector = !!message.payload.smartSelector
@@ -316,10 +327,11 @@ function App() {
     isScraping,
   ])
 
-  const saveSettings = (format: "csv" | "json") => {
-    setExportFormat(format)
-    chrome.storage.local.set({
-      scrapy_settings: { defaultExportFormat: format },
+  const saveSettings = (key: string, value: any) => {
+    chrome.storage.local.get(["scrapy_settings"], (res) => {
+      const currentSettings = res.scrapy_settings || {}
+      const newSettings = { ...currentSettings, [key]: value }
+      chrome.storage.local.set({ scrapy_settings: newSettings })
     })
   }
 
@@ -544,21 +556,26 @@ function App() {
         if (abortController.current) break
 
         setStatusText(`Extracting Surface Data (Page ${currentPage})...`)
+        // Pass stealth mode flag to content script
         await new Promise((resolve) =>
           chrome.tabs.sendMessage(
             workerTabId,
-            { action: "SCROLL_PAGE" },
+            { action: "SCROLL_PAGE", payload: { isStealth: stealthMode } },
             resolve,
           ),
         )
-        await randomSleep(800, 1500)
+        await randomSleep(stealthMode ? 1200 : 800, stealthMode ? 2500 : 1500)
 
         const scrapeRes: any = await new Promise((resolve) =>
           chrome.tabs.sendMessage(
             workerTabId,
             {
               action: "EXECUTE_SCRAPE",
-              payload: { schema: scrapedNodes, containerSelector },
+              payload: {
+                schema: scrapedNodes,
+                containerSelector,
+                isStealth: stealthMode,
+              },
             },
             resolve,
           ),
@@ -570,15 +587,12 @@ function App() {
           break
         }
 
-        // Test Run Constraints: Only 1 page, slice to max 5 rows.
         if (runMode === "test") {
-          if (currentDataState.length > 5) {
+          if (currentDataState.length > 5)
             currentDataState = currentDataState.slice(0, 5)
-          }
           break
         }
 
-        // Crash Recovery Auto-Save
         if (runMode === "full") {
           chrome.storage.local.set({ scrapy_recovery_data: currentDataState })
         }
@@ -592,7 +606,10 @@ function App() {
 
         if (navMode === "infinite") {
           setStatusText(`Scrolling down...`)
-          await randomSleep(3000, 5000)
+          await randomSleep(
+            stealthMode ? 4000 : 3000,
+            stealthMode ? 7000 : 5000,
+          )
           currentPage++
         } else if (navMode === "loadMore" || navMode === "next") {
           if (!paginationSelectors || paginationSelectors.length === 0) break
@@ -607,7 +624,10 @@ function App() {
               workerTabId,
               {
                 action: "CLICK_NEXT",
-                payload: { selectors: paginationSelectors },
+                payload: {
+                  selectors: paginationSelectors,
+                  isStealth: stealthMode,
+                },
               },
               resolve,
             ),
@@ -670,7 +690,10 @@ function App() {
           const deepRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
-              { action: "EXECUTE_SCRAPE", payload: { schema: deepNodes } },
+              {
+                action: "EXECUTE_SCRAPE",
+                payload: { schema: deepNodes, isStealth: stealthMode },
+              },
               resolve,
             ),
           )
@@ -685,12 +708,14 @@ function App() {
             currentDataState[i]["_deep_scrape_status"] = "Failed Extraction"
           }
 
-          // Auto-save update with deep scrape info
           if (runMode === "full") {
             chrome.storage.local.set({ scrapy_recovery_data: currentDataState })
           }
 
-          await randomSleep(2000, 4000)
+          await randomSleep(
+            stealthMode ? 3000 : 2000,
+            stealthMode ? 6000 : 4000,
+          )
         }
       }
 
@@ -711,10 +736,27 @@ function App() {
         setPreviewData(cleanedData)
         setShowPreviewModal(true)
       } else {
+        // Webhook Delivery
+        if (webhookUrl && cleanedData.length > 0) {
+          setStatusText(`Delivering data to Webhook...`)
+          try {
+            const res = await fetch(webhookUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(cleanedData),
+            })
+            if (res.ok) setStatusText("Webhook delivered successfully!")
+            else setStatusText("Webhook delivery failed.")
+            await randomSleep(1500, 2000)
+          } catch (e) {
+            setStatusText("Webhook delivery error.")
+            await randomSleep(1500, 2000)
+          }
+        }
+
         setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
         if (cleanedData.length > 0) {
           exportDataBlob(cleanedData, exportFormat)
-          // Clear recovery data on successful completion
           chrome.storage.local.remove("scrapy_recovery_data")
         }
       }
@@ -1249,14 +1291,17 @@ function App() {
               <X className="w-4 h-4" />
             </Button>
           </header>
-          <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          <div className="flex-1 overflow-y-auto p-6 space-y-8">
             <div className="space-y-3">
-              <Label className="text-xs text-muted-foreground">
-                Default Export Format
+              <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Default Export Format
               </Label>
               <Select
                 value={exportFormat}
-                onValueChange={(val: "csv" | "json") => saveSettings(val)}
+                onValueChange={(val: "csv" | "json") => {
+                  setExportFormat(val)
+                  saveSettings("defaultExportFormat", val)
+                }}
               >
                 <SelectTrigger className="w-full bg-background border-border/50">
                   <SelectValue />
@@ -1266,6 +1311,50 @@ function App() {
                   <SelectItem value="csv">.CSV (Spreadsheets)</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+
+            <div className="space-y-3 pt-4 border-t border-border/30">
+              <div className="space-y-1">
+                <Label className="text-xs text-indigo-400 flex items-center gap-1.5">
+                  <Webhook className="w-3.5 h-3.5" /> Webhook Integration
+                </Label>
+                <p className="text-[10px] text-muted-foreground">
+                  Automatically POST JSON data to this URL when a scrape
+                  finishes.
+                </p>
+              </div>
+              <Input
+                placeholder="https://your-n8n-or-crm-webhook-url.com"
+                value={webhookUrl}
+                onChange={(e) => {
+                  setWebhookUrl(e.target.value)
+                  saveSettings("webhookUrl", e.target.value)
+                }}
+                className="bg-background border-border/50 text-xs font-mono h-9"
+              />
+            </div>
+
+            <div className="space-y-3 pt-4 border-t border-border/30">
+              <div className="flex items-center justify-between">
+                <div className="space-y-1">
+                  <Label className="text-xs text-rose-400 flex items-center gap-1.5">
+                    <Ghost className="w-3.5 h-3.5" /> Stealth Mode
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground pr-4">
+                    Simulates human-like scrolling and adds randomized
+                    micro-delays to actions to bypass basic bot protection.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={stealthMode}
+                  onChange={(e) => {
+                    setStealthMode(e.target.checked)
+                    saveSettings("stealthMode", e.target.checked)
+                  }}
+                  className="accent-rose-500 w-5 h-5 shrink-0"
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -1450,9 +1539,12 @@ function App() {
               variant="ghost"
               size="icon"
               onClick={() => setShowSettings(true)}
-              className="w-7 h-7 text-muted-foreground hover:text-foreground"
+              className="w-7 h-7 text-muted-foreground hover:text-foreground relative"
             >
               <Settings className="w-4 h-4" />
+              {(webhookUrl || stealthMode) && (
+                <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-indigo-500 rounded-full"></span>
+              )}
             </Button>
             <Button
               variant="ghost"
@@ -1939,7 +2031,10 @@ function App() {
               <Select
                 disabled={scrapedNodes.length === 0}
                 value={exportFormat}
-                onValueChange={(val: "csv" | "json") => setExportFormat(val)}
+                onValueChange={(val: "csv" | "json") => {
+                  setExportFormat(val)
+                  saveSettings("defaultExportFormat", val)
+                }}
               >
                 <SelectTrigger className="w-[85px] h-10 text-xs bg-secondary/50 border-border/50 rounded-lg shadow-sm">
                   <SelectValue />

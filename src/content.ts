@@ -63,51 +63,39 @@ const getExactSelector = (el: HTMLElement): string => {
   return path.join(" > ")
 }
 
-// ROBUST PAGINATION SELECTOR ENGINE
 const getRobustPaginationSelectors = (clickedEl: HTMLElement): string[] => {
   const selectors: string[] = []
-
-  // Climb the tree slightly in case the user clicked an inner <span> or <svg> inside the button
   let targetEl = clickedEl
   const interactiveParent = clickedEl.closest(
     'button, a, [role="button"]',
   ) as HTMLElement
   if (interactiveParent) targetEl = interactiveParent
 
-  // 1. Semantic Attributes (Highest Reliability)
   const ariaLabel = targetEl.getAttribute("aria-label")
   if (ariaLabel && ariaLabel.toLowerCase().includes("next")) {
     selectors.push(
       `${targetEl.tagName.toLowerCase()}[aria-label="${ariaLabel}"]`,
     )
   }
-  if (targetEl instanceof HTMLAnchorElement && targetEl.rel === "next") {
+  if (targetEl instanceof HTMLAnchorElement && targetEl.rel === "next")
     selectors.push(`a[rel="next"]`)
-  }
 
-  // 2. Class names containing 'next'
   if (targetEl.className && typeof targetEl.className === "string") {
     const classes = targetEl.className.split(" ")
     const nextClass = classes.find((c) => c.toLowerCase().includes("next"))
     if (nextClass) selectors.push(`.${nextClass}`)
   }
 
-  // 3. Text content (XPath generation)
   const textContent = targetEl.innerText.trim().toLowerCase()
   if (["next", "next page", ">", "→"].includes(textContent)) {
-    // Prefix with xpath= so our executor knows how to handle it
     selectors.push(
       `xpath=//${targetEl.tagName.toLowerCase()}[normalize-space(text())='${targetEl.innerText.trim()}']`,
     )
   }
 
-  // 4. Exact DOM Path (Brittle but acts as a solid fallback)
   selectors.push(getExactSelector(targetEl))
-
-  // 5. Generic class/tag path
   selectors.push(generateSelector(targetEl))
 
-  // Remove exact duplicates
   return Array.from(new Set(selectors))
 }
 
@@ -208,7 +196,6 @@ const handleClick = (e: MouseEvent) => {
         },
       })
     } else if (currentSelectionMode === "pagination") {
-      // Use the new Robust Engine
       const selectors = getRobustPaginationSelectors(hoveredElement)
       chrome.runtime.sendMessage({
         action: "PAGINATION_SELECTED",
@@ -277,7 +264,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           .querySelectorAll(containerSelector)
           .forEach((el) => el.classList.add("web-scrapy-container-selected"))
 
-      // Highlight the first valid pagination selector found
       if (paginationSelectors && Array.isArray(paginationSelectors)) {
         for (const sel of paginationSelectors) {
           try {
@@ -291,12 +277,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 null,
               )
               el = result.singleNodeValue as HTMLElement
-            } else {
-              el = document.querySelector(sel)
-            }
+            } else el = document.querySelector(sel)
             if (el) {
               el.classList.add("web-scrapy-pagination-selected")
-              break // Only highlight one
+              break
             }
           } catch (e) {}
         }
@@ -307,7 +291,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (col.targetingStrategy === "strict") activeSel = col.exactSelector
         if (col.targetingStrategy === "smart" && col.smartSelector)
           activeSel = col.smartSelector
-
         if (activeSel && col.targetingStrategy !== "label") {
           document
             .querySelectorAll(activeSel)
@@ -343,17 +326,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (shield) shield.remove()
     sendResponse({ status: "success" })
   }
+
   if (request.action === "SCROLL_PAGE") {
-    window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
-    setTimeout(() => sendResponse({ status: "success" }), 1500)
+    const { isStealth } = request.payload || {}
+    if (isStealth) {
+      // STEALTH: Human-like incremental smooth scrolling
+      const scrollStep = window.innerHeight / 2.5
+      let currentPos = window.scrollY
+      const targetPos = document.body.scrollHeight
+
+      const scrollInterval = setInterval(
+        () => {
+          const jump = scrollStep + (Math.random() * 100 - 50) // Add jitter to jump distance
+          window.scrollBy({ top: jump, behavior: "smooth" })
+          currentPos += jump
+
+          if (
+            window.scrollY + window.innerHeight >=
+            document.body.scrollHeight - 50
+          ) {
+            clearInterval(scrollInterval)
+            setTimeout(
+              () => sendResponse({ status: "success" }),
+              400 + Math.random() * 500,
+            )
+          }
+        },
+        300 + Math.random() * 400,
+      ) // Randomized time between scrolls
+    } else {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
+      setTimeout(() => sendResponse({ status: "success" }), 1500)
+    }
     return true
   }
 
   if (request.action === "EXECUTE_SCRAPE") {
     ;(async () => {
       try {
-        const schema = request.payload.schema
-        const containerSelector = request.payload.containerSelector
+        const { schema, containerSelector, isStealth } = request.payload
         const scrapedData: any[] = []
 
         const extractElementValue = (
@@ -446,7 +457,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       ) as HTMLElement
                       if (btn) btn.click()
                     } else if (action.type === "wait") {
-                      await sleep(Number(action.value) || 500)
+                      // STEALTH: Add micro-jitter to waits
+                      const waitTime = Number(action.value) || 500
+                      const jitter = isStealth ? Math.random() * 200 - 100 : 0
+                      await sleep(Math.max(100, waitTime + jitter))
                     } else if (action.type === "type" && action.selector) {
                       const input = container.querySelector(
                         action.selector,
@@ -493,7 +507,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     ) as HTMLElement[]
                     btns.forEach((b) => b.click())
                   } else if (action.type === "wait") {
-                    await sleep(Number(action.value) || 500)
+                    const waitTime = Number(action.value) || 500
+                    const jitter = isStealth ? Math.random() * 200 - 100 : 0
+                    await sleep(Math.max(100, waitTime + jitter))
                   } else if (action.type === "type" && action.selector) {
                     const inputs = Array.from(
                       document.querySelectorAll(action.selector),
@@ -581,9 +597,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true
   }
 
-  // UPDATED: MULTI-STRATEGY EXECUTION
   if (request.action === "CLICK_NEXT") {
-    const selectors = request.payload.selectors as string[]
+    const { selectors, isStealth } = request.payload
     let targetBtn: HTMLElement | null = null
 
     if (!selectors || selectors.length === 0) {
@@ -591,7 +606,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true
     }
 
-    // Try each strategy in order until we find a button on the screen
     for (const sel of selectors) {
       try {
         if (sel.startsWith("xpath=")) {
@@ -614,13 +628,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             break
           }
         }
-      } catch (e) {
-        console.warn("Strategy failed:", sel)
-      }
+      } catch (e) {}
     }
 
     if (targetBtn) {
-      // Robust check for standard disablement
       const isDisabled =
         (targetBtn as HTMLButtonElement).disabled ||
         targetBtn.classList.contains("disabled") ||
@@ -633,8 +644,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           message: "Next button is present but disabled",
         })
       } else {
-        targetBtn.click()
-        sendResponse({ status: "success" })
+        // STEALTH: Add micro-delay before clicking to simulate user reading the bottom of the page
+        if (isStealth) {
+          setTimeout(
+            () => {
+              targetBtn?.click()
+              sendResponse({ status: "success" })
+            },
+            300 + Math.random() * 500,
+          )
+          return true
+        } else {
+          targetBtn.click()
+          sendResponse({ status: "success" })
+        }
       }
     } else {
       sendResponse({
