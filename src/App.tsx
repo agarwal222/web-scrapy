@@ -7,16 +7,20 @@ import {
   BoxSelect,
   Check,
   Clock,
+  DatabaseBackup,
   Download,
   ExternalLink,
   Eye,
   EyeOff,
   Filter,
+  FlaskConical,
   Keyboard,
   Layers,
   Link2,
   MousePointer2,
   MousePointerClick,
+  Pause,
+  Play,
   Plus,
   Save,
   Settings,
@@ -83,7 +87,6 @@ interface Recipe {
   deepSchema: ScrapedNode[]
   container: string | null
   navMode: NavMode
-  // Updated to handle robust array of selectors
   pagination: string[] | string | null
   deepLinkColumn: string | null
 }
@@ -140,6 +143,18 @@ function App() {
   const [statusText, setStatusText] = useState("")
   const [liveData, setLiveData] = useState<any[]>([])
 
+  // Pause & Resume Controllers
+  const abortController = useRef(false)
+  const pauseController = useRef(false)
+  const [isPaused, setIsPaused] = useState(false)
+
+  // Test Run Controllers
+  const [showPreviewModal, setShowPreviewModal] = useState(false)
+  const [previewData, setPreviewData] = useState<any[]>([])
+
+  // Crash Recovery
+  const [recoveredData, setRecoveredData] = useState<any[] | null>(null)
+
   const [scrapedNodes, setScrapedNodes] = useState<ScrapedNode[]>([])
   const [containerSelector, setContainerSelector] = useState<string | null>(
     null,
@@ -147,7 +162,6 @@ function App() {
   const [containerCount, setContainerCount] = useState<number>(0)
 
   const [navMode, setNavMode] = useState<NavMode>("none")
-  // Updated state for array of pagination selectors
   const [paginationSelectors, setPaginationSelectors] = useState<
     string[] | null
   >(null)
@@ -167,7 +181,6 @@ function App() {
   const [showRecipeManager, setShowRecipeManager] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const abortController = useRef(false)
 
   useEffect(() => {
     const init = async () => {
@@ -180,7 +193,7 @@ function App() {
           const domain = new URL(tab.url).hostname.replace("www.", "")
           setActiveDomain(domain)
           chrome.storage.local.get(
-            ["scrapy_recipes", "scrapy_settings"],
+            ["scrapy_recipes", "scrapy_settings", "scrapy_recovery_data"],
             (result) => {
               if (result.scrapy_recipes) {
                 setRecipes(result.scrapy_recipes)
@@ -192,6 +205,12 @@ function App() {
               }
               if (result.scrapy_settings?.defaultExportFormat)
                 setExportFormat(result.scrapy_settings.defaultExportFormat)
+              if (
+                result.scrapy_recovery_data &&
+                result.scrapy_recovery_data.length > 0
+              ) {
+                setRecoveredData(result.scrapy_recovery_data)
+              }
             },
           )
         } catch (e) {}
@@ -200,6 +219,7 @@ function App() {
     init()
 
     const handleMessage = (message: any) => {
+      // Message handling remains identical
       if (message.action === "ELEMENTS_SELECTED") {
         setIsSelecting(false)
         const hasSmartSelector = !!message.payload.smartSelector
@@ -333,16 +353,14 @@ function App() {
     setScrapedNodes(recipe.schema)
     setContainerSelector(recipe.container)
     setNavMode(recipe.navMode || "none")
-    // Handle backward compatibility if older recipes saved pagination as a single string
-    if (recipe.pagination) {
+    if (recipe.pagination)
       setPaginationSelectors(
         Array.isArray(recipe.pagination)
           ? recipe.pagination
           : [recipe.pagination],
       )
-    } else {
-      setPaginationSelectors(null)
-    }
+    else setPaginationSelectors(null)
+
     if (recipe.deepSchema && recipe.deepSchema.length > 0) {
       setIsDeepScrapeEnabled(true)
       setDeepNodes(recipe.deepSchema)
@@ -457,11 +475,33 @@ function App() {
     return rows.join("\n")
   }
 
-  const handleScrapeAndDownload = async () => {
+  const exportDataBlob = (data: any[], format: "csv" | "json") => {
+    let blob: Blob
+    let filename: string
+    if (format === "csv") {
+      blob = new Blob([convertToCSV(data)], { type: "text/csv;charset=utf-8;" })
+      filename = `scrapy_export_${Date.now()}.csv`
+    } else {
+      blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json;charset=utf-8;",
+      })
+      filename = `scrapy_export_${Date.now()}.json`
+    }
+    chrome.downloads.download({
+      url: URL.createObjectURL(blob),
+      filename,
+      saveAs: false,
+    })
+  }
+
+  const handleScrapeAndDownload = async (runMode: "test" | "full" = "full") => {
     abortController.current = false
+    pauseController.current = false
+    setIsPaused(false)
     setIsScraping(true)
     setSuggestedRecipe(null)
     setLiveData([])
+
     let currentDataState: any[] = []
     let currentPage = 1
     const keepScraping = true
@@ -492,9 +532,17 @@ function App() {
 
       while (keepScraping) {
         if (abortController.current) {
-          setStatusText("Aborted.")
+          setStatusText("Job Stopped Early.")
           break
         }
+
+        while (pauseController.current) {
+          setStatusText("Paused... Click Resume to continue.")
+          await randomSleep(1000, 1000)
+          if (abortController.current) break
+        }
+        if (abortController.current) break
+
         setStatusText(`Extracting Surface Data (Page ${currentPage})...`)
         await new Promise((resolve) =>
           chrome.tabs.sendMessage(
@@ -520,6 +568,19 @@ function App() {
           setLiveData([...currentDataState])
         } else {
           break
+        }
+
+        // Test Run Constraints: Only 1 page, slice to max 5 rows.
+        if (runMode === "test") {
+          if (currentDataState.length > 5) {
+            currentDataState = currentDataState.slice(0, 5)
+          }
+          break
+        }
+
+        // Crash Recovery Auto-Save
+        if (runMode === "full") {
+          chrome.storage.local.set({ scrapy_recovery_data: currentDataState })
         }
 
         if (
@@ -553,10 +614,6 @@ function App() {
           )
 
           if (clickRes?.status !== "success") {
-            console.log(
-              "Pagination click failed or exhausted.",
-              clickRes.message,
-            )
             break
           }
           await randomSleep(
@@ -583,9 +640,16 @@ function App() {
       ) {
         for (let i = 0; i < currentDataState.length; i++) {
           if (abortController.current) {
-            setStatusText("Deep Scrape Aborted.")
+            setStatusText("Deep Scrape Stopped.")
             break
           }
+          while (pauseController.current) {
+            setStatusText("Paused... Click Resume to continue.")
+            await randomSleep(1000, 1000)
+            if (abortController.current) break
+          }
+          if (abortController.current) break
+
           const targetUrl = currentDataState[i][deepLinkColumn]
           if (
             !targetUrl ||
@@ -620,42 +684,39 @@ function App() {
           } else {
             currentDataState[i]["_deep_scrape_status"] = "Failed Extraction"
           }
+
+          // Auto-save update with deep scrape info
+          if (runMode === "full") {
+            chrome.storage.local.set({ scrapy_recovery_data: currentDataState })
+          }
+
           await randomSleep(2000, 4000)
         }
       }
 
-      setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
-      if (currentDataState.length > 0) {
-        const cleanedData = currentDataState.map((row) => {
-          const newRow = { ...row }
-          const allNodes = [
-            ...scrapedNodes,
-            ...(isDeepScrapeEnabled ? deepNodes : []),
-          ]
-          allNodes.forEach((n) => {
-            if (n.hideFromExport) delete newRow[n.columnName]
-          })
-          return newRow
+      // Final processing
+      const cleanedData = currentDataState.map((row) => {
+        const newRow = { ...row }
+        const allNodes = [
+          ...scrapedNodes,
+          ...(isDeepScrapeEnabled ? deepNodes : []),
+        ]
+        allNodes.forEach((n) => {
+          if (n.hideFromExport) delete newRow[n.columnName]
         })
+        return newRow
+      })
 
-        let blob: Blob
-        let filename: string
-        if (exportFormat === "csv") {
-          blob = new Blob([convertToCSV(cleanedData)], {
-            type: "text/csv;charset=utf-8;",
-          })
-          filename = `scrapy_export_${Date.now()}.csv`
-        } else {
-          blob = new Blob([JSON.stringify(cleanedData, null, 2)], {
-            type: "application/json;charset=utf-8;",
-          })
-          filename = `scrapy_export_${Date.now()}.json`
+      if (runMode === "test") {
+        setPreviewData(cleanedData)
+        setShowPreviewModal(true)
+      } else {
+        setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
+        if (cleanedData.length > 0) {
+          exportDataBlob(cleanedData, exportFormat)
+          // Clear recovery data on successful completion
+          chrome.storage.local.remove("scrapy_recovery_data")
         }
-        chrome.downloads.download({
-          url: URL.createObjectURL(blob),
-          filename,
-          saveAs: false,
-        })
       }
     } catch (error) {
       console.error("Scraping loop failed", error)
@@ -667,6 +728,8 @@ function App() {
       setIsScraping(false)
       setStatusText("")
       abortController.current = false
+      pauseController.current = false
+      setIsPaused(false)
     }
   }
 
@@ -1170,9 +1233,9 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* Settings, Recipes, and Header stay the same */}
+      {/* Settings Modal */}
       {showSettings && (
-        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur flex flex-col">
+        <div className="absolute inset-0 z-[60] bg-background/95 backdrop-blur flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
             <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
               <Settings className="w-4 h-4" /> Global Settings
@@ -1208,8 +1271,9 @@ function App() {
         </div>
       )}
 
+      {/* Recipe Modal */}
       {showRecipeManager && (
-        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur flex flex-col">
+        <div className="absolute inset-0 z-[60] bg-background/95 backdrop-blur flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
             <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
               <Bookmark className="w-4 h-4" /> Saved Recipes
@@ -1290,6 +1354,89 @@ function App() {
         </div>
       )}
 
+      {/* Live Preview Modal */}
+      {showPreviewModal && (
+        <div className="absolute inset-0 z-[60] bg-background/95 backdrop-blur flex flex-col">
+          <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
+            <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
+              <FlaskConical className="w-4 h-4" /> Live Preview (First 5 Rows)
+            </h2>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="w-6 h-6 hover:bg-secondary/50"
+              onClick={() => setShowPreviewModal(false)}
+            >
+              <X className="w-4 h-4" />
+            </Button>
+          </header>
+          <div className="flex-1 overflow-auto p-4 custom-scrollbar">
+            <div className="border border-border/40 rounded-lg overflow-hidden bg-background shadow-sm">
+              <div className="overflow-x-auto custom-scrollbar">
+                <table className="w-full text-left text-xs whitespace-nowrap">
+                  <thead className="bg-secondary/20 border-b border-border/40">
+                    <tr>
+                      <th className="px-3 py-2 font-medium text-muted-foreground w-12 border-r border-border/20">
+                        #
+                      </th>
+                      {getTableHeaders().map((h, i) => (
+                        <th
+                          key={i}
+                          className="px-3 py-2 font-medium text-muted-foreground border-r border-border/20"
+                        >
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewData.map((row, idx) => (
+                      <tr
+                        key={idx}
+                        className="border-b border-border/20 hover:bg-secondary/10"
+                      >
+                        <td className="px-3 py-2 text-muted-foreground font-mono border-r border-border/20">
+                          {idx + 1}
+                        </td>
+                        {getTableHeaders().map((h, i) => (
+                          <td
+                            key={i}
+                            className="px-3 py-2 max-w-[200px] truncate border-r border-border/20"
+                            title={row[h]}
+                          >
+                            {row[h] || "-"}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div className="p-4 border-t border-border/40 flex justify-end gap-2 bg-secondary/5">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowPreviewModal(false)}
+            >
+              Adjust Configuration
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setShowPreviewModal(false)
+                handleScrapeAndDownload("full")
+              }}
+              className="bg-primary text-primary-foreground"
+            >
+              <Play className="w-3.5 h-3.5 mr-1" /> Looks Good, Start Scrape
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Main App Header */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-border/40 shrink-0 bg-background/95 backdrop-blur z-10">
         <div className="flex items-center gap-2 text-primary">
           <BoxSelect className="w-4 h-4" />{" "}
@@ -1335,6 +1482,39 @@ function App() {
         )}
       </header>
 
+      {/* Recovery Banner */}
+      {!isScraping && recoveredData && (
+        <div className="mx-4 mt-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-center justify-between animate-in fade-in slide-in-from-top-1">
+          <div className="flex items-center gap-2 text-amber-500 text-xs font-medium">
+            <DatabaseBackup className="w-4 h-4" />
+            <span>
+              Recovered {recoveredData.length} rows from previous session.
+            </span>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 text-[10px] text-amber-500 hover:text-amber-400 hover:bg-amber-500/20"
+              onClick={() => {
+                setRecoveredData(null)
+                chrome.storage.local.remove("scrapy_recovery_data")
+              }}
+            >
+              Dismiss
+            </Button>
+            <Button
+              size="sm"
+              className="h-6 text-[10px] bg-amber-500 text-black hover:bg-amber-400"
+              onClick={() => exportDataBlob(recoveredData, exportFormat)}
+            >
+              Export Data
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Main Content Area */}
       {isScraping ? (
         <main className="flex-1 flex flex-col overflow-hidden bg-background">
           <div className="p-4 border-b border-border/40 flex items-center justify-between bg-secondary/5">
@@ -1696,19 +1876,53 @@ function App() {
         </main>
       )}
 
+      {/* FOOTER ACTION AREA */}
       <footer className="px-4 py-4 border-t border-border/40 shrink-0 bg-background/95 backdrop-blur z-10 space-y-3">
         {isScraping ? (
-          <Button
-            onClick={() => {
-              abortController.current = true
-            }}
-            variant="destructive"
-            className="w-full h-10 shadow-sm rounded-lg flex items-center justify-center gap-2"
-          >
-            <Square className="w-4 h-4 fill-current" /> Abort Workload
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              onClick={() => {
+                pauseController.current = !pauseController.current
+                setIsPaused(pauseController.current)
+              }}
+              variant={isPaused ? "default" : "outline"}
+              className={`flex-1 h-10 shadow-sm rounded-lg flex items-center justify-center gap-2 transition-colors ${isPaused ? "bg-amber-500 text-black hover:bg-amber-400" : "border-amber-500/50 text-amber-500 hover:bg-amber-500/10"}`}
+            >
+              {isPaused ? (
+                <>
+                  <Play className="w-4 h-4 fill-current" /> Resume
+                </>
+              ) : (
+                <>
+                  <Pause className="w-4 h-4 fill-current" /> Pause Workload
+                </>
+              )}
+            </Button>
+            <Button
+              onClick={() => {
+                abortController.current = true
+              }}
+              variant="destructive"
+              className="flex-1 h-10 shadow-sm rounded-lg flex items-center justify-center gap-2"
+            >
+              <Square className="w-4 h-4 fill-current" /> Stop & Export Data
+            </Button>
+          </div>
         ) : (
           <div className="flex flex-col gap-2">
+            {/* Test Run Button */}
+            <div className="flex gap-2 mb-1">
+              <Button
+                disabled={scrapedNodes.length === 0}
+                onClick={() => handleScrapeAndDownload("test")}
+                variant="outline"
+                className="flex-1 h-8 text-xs border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/10 hover:text-indigo-300 transition-colors"
+              >
+                <FlaskConical className="w-3.5 h-3.5 mr-1" /> Schema Live
+                Preview (Test Run)
+              </Button>
+            </div>
+
             {(scrapedNodes.length > 0 || deepNodes.length > 0) && (
               <div className="flex justify-end mb-1">
                 <button
@@ -1719,6 +1933,8 @@ function App() {
                 </button>
               </div>
             )}
+
+            {/* Main Export & Scrape */}
             <div className="flex gap-2">
               <Select
                 disabled={scrapedNodes.length === 0}
@@ -1739,7 +1955,7 @@ function App() {
               </Select>
               <Button
                 disabled={scrapedNodes.length === 0}
-                onClick={() => handleScrapeAndDownload()}
+                onClick={() => handleScrapeAndDownload("full")}
                 className="flex-1 h-10 rounded-lg shadow-sm font-medium flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
               >
                 <ExternalLink className="w-4 h-4" /> Start Background Scrape
