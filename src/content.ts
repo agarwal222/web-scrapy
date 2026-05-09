@@ -232,7 +232,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (el) el.classList.add("web-scrapy-pagination-selected")
       }
       schema.forEach((col: any) => {
-        // Find the active selector based on the targeting strategy
         let activeSel = col.selector
         if (col.targetingStrategy === "strict") activeSel = col.exactSelector
         if (col.targetingStrategy === "smart" && col.smartSelector)
@@ -287,7 +286,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const containerSelector = request.payload.containerSelector
         const scrapedData: any[] = []
 
-        // Helper to extract a single element's data based on column settings
         const extractElementValue = (
           el: HTMLElement | null,
           col: any,
@@ -302,7 +300,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             else val = el.getAttribute(col.attribute) || ""
           }
 
-          // Apply Post-Processing Regex Formatter
           if (val && col.regexPreset && col.regexPreset !== "none") {
             let match = null
             if (col.regexPreset === "email") {
@@ -310,7 +307,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
               )
             } else if (col.regexPreset === "phone") {
-              // Standard robust phone matcher
               match = val.match(
                 /(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/,
               )
@@ -330,7 +326,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return val
         }
 
-        // Helper to locate an element relative to a parent container
         const locateElement = (
           container: ParentNode,
           col: any,
@@ -340,7 +335,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
           if (col.targetingStrategy === "label" && col.anchorLabelText) {
             try {
-              // Create an XPath to find the element containing the exact text inside this container
               const xpath = `descendant-or-self::*[contains(text(), '${col.anchorLabelText}')]`
               const result = document.evaluate(
                 xpath,
@@ -352,16 +346,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               const labelNode = result.singleNodeValue as HTMLElement
 
               if (labelNode) {
-                // Try grabbing the next sibling first
                 if (labelNode.nextElementSibling) {
                   return labelNode.nextElementSibling as HTMLElement
                 }
-                // If it's isolated in a span/div, grab the parent's next sibling
                 if (labelNode.parentElement?.nextElementSibling) {
                   return labelNode.parentElement
                     .nextElementSibling as HTMLElement
                 }
-                // Fallback: return the label node itself, hoping regex can parse the text out of it
                 return labelNode
               }
             } catch (e) {
@@ -369,7 +360,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
             return null
           }
-          // Default: Pattern or Strict Path
           const targetSel =
             col.targetingStrategy === "strict"
               ? col.exactSelector
@@ -385,7 +375,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
 
-            // Execute Pre-Scrape Actions
             for (const col of schema) {
               if (col.actions && col.actions.length > 0) {
                 for (const action of col.actions) {
@@ -416,10 +405,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               }
             }
 
-            // Extract Data
             for (const col of schema) {
               const el = locateElement(container, col)
               rowObj[col.columnName] = extractElementValue(el, col)
+            }
+
+            // Process Fallbacks
+            for (const col of schema) {
+              if (!rowObj[col.columnName] && col.fallbackColumnId) {
+                const fallbackCol = schema.find(
+                  (c: any) => c.id === col.fallbackColumnId,
+                )
+                if (fallbackCol && rowObj[fallbackCol.columnName]) {
+                  rowObj[col.columnName] = rowObj[fallbackCol.columnName]
+                }
+              }
             }
             scrapedData.push(rowObj)
           }
@@ -466,7 +466,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               col.targetingStrategy === "label" &&
               col.anchorLabelText
             ) {
-              // Advanced Label finding across whole document
               const xpath = `//*[contains(text(), '${col.anchorLabelText}')]`
               const result = document.evaluate(
                 xpath,
@@ -505,6 +504,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               const el = col.elements[i] as HTMLElement | undefined
               rowObj[col.columnName] = extractElementValue(el || null, col)
             })
+
+            // Process Fallbacks
+            columnData.forEach((col: any) => {
+              if (!rowObj[col.columnName] && col.fallbackColumnId) {
+                const fallbackCol = columnData.find(
+                  (c: any) => c.id === col.fallbackColumnId,
+                )
+                if (fallbackCol && rowObj[fallbackCol.columnName]) {
+                  rowObj[col.columnName] = rowObj[fallbackCol.columnName]
+                }
+              }
+            })
+
             scrapedData.push(rowObj)
           }
         }

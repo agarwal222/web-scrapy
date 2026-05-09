@@ -9,6 +9,8 @@ import {
   Clock,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   Filter,
   Keyboard,
   Layers,
@@ -59,6 +61,10 @@ interface ScrapedNode {
   smartSelector?: string
   targetingStrategy: "pattern" | "strict" | "smart" | "label"
   anchorLabelText?: string
+
+  // Fallbacks & Visibility
+  fallbackColumnId?: string
+  hideFromExport?: boolean
 
   // Extraction & Post-Processing
   columnName: string
@@ -211,6 +217,8 @@ function App() {
           smartSelector: message.payload.smartSelector,
           targetingStrategy: hasSmartSelector ? "smart" : "pattern",
           regexPreset: "none",
+          fallbackColumnId: undefined,
+          hideFromExport: false,
 
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
@@ -614,15 +622,30 @@ function App() {
 
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
       if (currentDataState.length > 0) {
+        // Strip out hidden columns before export
+        const cleanedData = currentDataState.map((row) => {
+          const newRow = { ...row }
+          const allNodes = [
+            ...scrapedNodes,
+            ...(isDeepScrapeEnabled ? deepNodes : []),
+          ]
+          allNodes.forEach((n) => {
+            if (n.hideFromExport) {
+              delete newRow[n.columnName]
+            }
+          })
+          return newRow
+        })
+
         let blob: Blob
         let filename: string
         if (exportFormat === "csv") {
-          blob = new Blob([convertToCSV(currentDataState)], {
+          blob = new Blob([convertToCSV(cleanedData)], {
             type: "text/csv;charset=utf-8;",
           })
           filename = `scrapy_export_${Date.now()}.csv`
         } else {
-          blob = new Blob([JSON.stringify(currentDataState, null, 2)], {
+          blob = new Blob([JSON.stringify(cleanedData, null, 2)], {
             type: "application/json;charset=utf-8;",
           })
           filename = `scrapy_export_${Date.now()}.json`
@@ -706,6 +729,7 @@ function App() {
   const renderNodeControls = (
     node: ScrapedNode,
     target: "surface" | "deep",
+    allNodes: ScrapedNode[],
   ) => {
     const activePreview =
       node.availableAttributes.find((a) => a.name === node.attribute)
@@ -718,7 +742,7 @@ function App() {
     return (
       <div
         key={node.id}
-        className="p-3.5 bg-secondary/10 rounded-xl border border-border/30 group transition-all"
+        className={`p-3.5 bg-secondary/10 rounded-xl border group transition-all ${node.hideFromExport ? "border-border/10 opacity-70" : "border-border/30"}`}
       >
         <div className="flex items-start justify-between mb-3">
           <div className="flex-1 space-y-1">
@@ -732,7 +756,7 @@ function App() {
                   ),
                 )
               }
-              className="bg-transparent border-transparent hover:border-border focus:border-border h-7 text-sm font-medium px-1 -ml-1 shadow-none rounded-md"
+              className={`bg-transparent border-transparent hover:border-border focus:border-border h-7 text-sm font-medium px-1 -ml-1 shadow-none rounded-md ${node.hideFromExport ? "text-muted-foreground" : ""}`}
             />
             <div className="flex items-center gap-2 px-1">
               <p className="text-[10px] text-muted-foreground font-mono">
@@ -745,17 +769,43 @@ function App() {
               )}
             </div>
           </div>
-          <Button
-            disabled={isScraping}
-            onClick={() =>
-              setNodes((prev) => prev.filter((n) => n.id !== node.id))
-            }
-            variant="ghost"
-            size="icon"
-            className="w-6 h-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 opacity-0 group-hover:opacity-100 transition-opacity"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </Button>
+          <div className="flex items-center">
+            <Button
+              disabled={isScraping}
+              onClick={() =>
+                setNodes((prev) =>
+                  prev.map((n) =>
+                    n.id === node.id
+                      ? { ...n, hideFromExport: !n.hideFromExport }
+                      : n,
+                  ),
+                )
+              }
+              variant="ghost"
+              size="icon"
+              title={
+                node.hideFromExport ? "Hidden from export" : "Visible in export"
+              }
+              className={`w-6 h-6 mr-1 transition-opacity ${node.hideFromExport ? "text-muted-foreground opacity-100" : "text-primary opacity-0 group-hover:opacity-100"}`}
+            >
+              {node.hideFromExport ? (
+                <EyeOff className="w-3.5 h-3.5" />
+              ) : (
+                <Eye className="w-3.5 h-3.5" />
+              )}
+            </Button>
+            <Button
+              disabled={isScraping}
+              onClick={() =>
+                setNodes((prev) => prev.filter((n) => n.id !== node.id))
+              }
+              variant="ghost"
+              size="icon"
+              className="w-6 h-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 opacity-0 group-hover:opacity-100 transition-opacity"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </Button>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 mb-3">
@@ -851,43 +901,81 @@ function App() {
         </div>
 
         <div className="pt-3 border-t border-border/50 space-y-2">
-          <div className="flex items-center justify-between mb-2">
-            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
-              <Target className="w-3 h-3" /> Targeting Strategy
-            </Label>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                <Target className="w-3 h-3" /> Strategy
+              </Label>
+              <Select
+                disabled={isScraping}
+                value={node.targetingStrategy || "pattern"}
+                onValueChange={(val: any) =>
+                  setNodes((prev) =>
+                    prev.map((n) =>
+                      n.id === node.id
+                        ? {
+                            ...n,
+                            targetingStrategy: val,
+                            selector:
+                              val === "strict"
+                                ? n.exactSelector
+                                : n.patternSelector,
+                          }
+                        : n,
+                    ),
+                  )
+                }
+              >
+                <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm rounded-md">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="pattern">Pattern Match</SelectItem>
+                  <SelectItem value="strict">Strict DOM Path</SelectItem>
+                  <SelectItem value="smart" disabled={!node.smartSelector}>
+                    Smart Attribute
+                  </SelectItem>
+                  <SelectItem value="label">Anchor to Label</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                Fallback To
+              </Label>
+              <Select
+                disabled={isScraping}
+                value={node.fallbackColumnId || "none"}
+                onValueChange={(val: string) =>
+                  setNodes((prev) =>
+                    prev.map((n) =>
+                      n.id === node.id
+                        ? {
+                            ...n,
+                            fallbackColumnId: val === "none" ? undefined : val,
+                          }
+                        : n,
+                    ),
+                  )
+                }
+              >
+                <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm rounded-md">
+                  <SelectValue placeholder="None" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">None</SelectItem>
+                  {allNodes
+                    .filter((n) => n.id !== node.id)
+                    .map((n) => (
+                      <SelectItem key={n.id} value={n.id}>
+                        {n.columnName}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
-          <Select
-            disabled={isScraping}
-            value={node.targetingStrategy || "pattern"}
-            onValueChange={(val: any) =>
-              setNodes((prev) =>
-                prev.map((n) =>
-                  n.id === node.id
-                    ? {
-                        ...n,
-                        targetingStrategy: val,
-                        selector:
-                          val === "strict"
-                            ? n.exactSelector
-                            : n.patternSelector,
-                      }
-                    : n,
-                ),
-              )
-            }
-          >
-            <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm rounded-md">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="pattern">Pattern Match</SelectItem>
-              <SelectItem value="strict">Strict DOM Path</SelectItem>
-              <SelectItem value="smart" disabled={!node.smartSelector}>
-                Smart Attribute (Auto)
-              </SelectItem>
-              <SelectItem value="label">Anchor to Text Label</SelectItem>
-            </SelectContent>
-          </Select>
 
           {node.targetingStrategy === "label" && (
             <div className="pt-2 animate-in fade-in slide-in-from-top-1">
@@ -906,9 +994,6 @@ function App() {
                 }
                 className="h-7 text-xs bg-black/20 border-indigo-500/30 focus-visible:border-indigo-500"
               />
-              <p className="text-[9px] text-muted-foreground mt-1">
-                Extracts the value immediately following this text.
-              </p>
             </div>
           )}
         </div>
@@ -1073,16 +1158,19 @@ function App() {
   }
 
   const getTableHeaders = () => {
-    const surfaceHeaders = scrapedNodes.map((n) => n.columnName)
+    // Only display columns that are NOT hidden
+    const surfaceHeaders = scrapedNodes
+      .filter((n) => !n.hideFromExport)
+      .map((n) => n.columnName)
     const deepHeaders = isDeepScrapeEnabled
-      ? deepNodes.map((n) => n.columnName)
+      ? deepNodes.filter((n) => !n.hideFromExport).map((n) => n.columnName)
       : []
     return [...surfaceHeaders, ...deepHeaders]
   }
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* Settings, Recipe Manager, Header, Loading States remain unchanged */}
+      {/* Settings Panel */}
       {showSettings && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
@@ -1120,6 +1208,7 @@ function App() {
         </div>
       )}
 
+      {/* Recipe Manager Panel */}
       {showRecipeManager && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
@@ -1417,7 +1506,7 @@ function App() {
                   </div>
                 )}
                 {scrapedNodes.map((node) =>
-                  renderNodeControls(node, "surface"),
+                  renderNodeControls(node, "surface", scrapedNodes),
                 )}
               </div>
             </div>
@@ -1500,7 +1589,9 @@ function App() {
                         here.
                       </div>
                     )}
-                    {deepNodes.map((node) => renderNodeControls(node, "deep"))}
+                    {deepNodes.map((node) =>
+                      renderNodeControls(node, "deep", deepNodes),
+                    )}
                   </div>
                 </div>
               </div>
