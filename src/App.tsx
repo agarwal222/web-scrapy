@@ -57,16 +57,13 @@ interface ScrapedNode {
   exactCount: number
   isExact: boolean
 
-  // Advanced Targeting
   smartSelector?: string
   targetingStrategy: "pattern" | "strict" | "smart" | "label"
   anchorLabelText?: string
 
-  // Fallbacks & Visibility
   fallbackColumnId?: string
   hideFromExport?: boolean
 
-  // Extraction & Post-Processing
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
@@ -86,7 +83,8 @@ interface Recipe {
   deepSchema: ScrapedNode[]
   container: string | null
   navMode: NavMode
-  pagination: string | null
+  // Updated to handle robust array of selectors
+  pagination: string[] | string | null
   deepLinkColumn: string | null
 }
 
@@ -149,9 +147,10 @@ function App() {
   const [containerCount, setContainerCount] = useState<number>(0)
 
   const [navMode, setNavMode] = useState<NavMode>("none")
-  const [paginationSelector, setPaginationSelector] = useState<string | null>(
-    null,
-  )
+  // Updated state for array of pagination selectors
+  const [paginationSelectors, setPaginationSelectors] = useState<
+    string[] | null
+  >(null)
 
   const [isDeepScrapeEnabled, setIsDeepScrapeEnabled] = useState(false)
   const [deepNodes, setDeepNodes] = useState<ScrapedNode[]>([])
@@ -213,13 +212,11 @@ function App() {
           patternCount: message.payload.patternCount,
           exactCount: message.payload.exactCount,
           isExact: false,
-
           smartSelector: message.payload.smartSelector,
           targetingStrategy: hasSmartSelector ? "smart" : "pattern",
           regexPreset: "none",
           fallbackColumnId: undefined,
           hideFromExport: false,
-
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
@@ -258,7 +255,7 @@ function App() {
 
       if (message.action === "PAGINATION_SELECTED") {
         setIsSelecting(false)
-        setPaginationSelector(message.payload.selector)
+        setPaginationSelectors(message.payload.selectors)
       }
       if (message.action === "CONTAINER_SELECTED") {
         setIsSelecting(false)
@@ -285,7 +282,7 @@ function App() {
           payload: {
             schema: [...scrapedNodes, ...deepNodes],
             containerSelector,
-            paginationSelector,
+            paginationSelectors,
           },
         })
       } catch (error) {}
@@ -295,7 +292,7 @@ function App() {
     scrapedNodes,
     deepNodes,
     containerSelector,
-    paginationSelector,
+    paginationSelectors,
     isScraping,
   ])
 
@@ -320,7 +317,7 @@ function App() {
       deepSchema: deepNodes,
       container: containerSelector,
       navMode: navMode,
-      pagination: paginationSelector,
+      pagination: paginationSelectors,
       deepLinkColumn: deepLinkColumn,
     }
     const updatedRecipes = { ...recipes }
@@ -336,7 +333,16 @@ function App() {
     setScrapedNodes(recipe.schema)
     setContainerSelector(recipe.container)
     setNavMode(recipe.navMode || "none")
-    setPaginationSelector(recipe.pagination)
+    // Handle backward compatibility if older recipes saved pagination as a single string
+    if (recipe.pagination) {
+      setPaginationSelectors(
+        Array.isArray(recipe.pagination)
+          ? recipe.pagination
+          : [recipe.pagination],
+      )
+    } else {
+      setPaginationSelectors(null)
+    }
     if (recipe.deepSchema && recipe.deepSchema.length > 0) {
       setIsDeepScrapeEnabled(true)
       setDeepNodes(recipe.deepSchema)
@@ -430,7 +436,7 @@ function App() {
   const clearSelection = () => {
     setScrapedNodes([])
     setDeepNodes([])
-    setPaginationSelector(null)
+    setPaginationSelectors(null)
     setContainerSelector(null)
     setIsDeepScrapeEnabled(false)
     setNavMode("none")
@@ -527,39 +533,39 @@ function App() {
           setStatusText(`Scrolling down...`)
           await randomSleep(3000, 5000)
           currentPage++
-        } else if (navMode === "loadMore") {
-          if (!paginationSelector) break
-          setStatusText(`Clicking Load More...`)
+        } else if (navMode === "loadMore" || navMode === "next") {
+          if (!paginationSelectors || paginationSelectors.length === 0) break
+          setStatusText(
+            navMode === "loadMore"
+              ? `Clicking Load More...`
+              : `Navigating to page ${currentPage + 1}...`,
+          )
+
           const clickRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
               {
                 action: "CLICK_NEXT",
-                payload: { selector: paginationSelector },
+                payload: { selectors: paginationSelectors },
               },
               resolve,
             ),
           )
-          if (clickRes?.status !== "success") break
-          await randomSleep(3000, 5000)
-          currentPage++
-        } else if (navMode === "next") {
-          if (!paginationSelector) break
-          setStatusText(`Navigating to page ${currentPage + 1}...`)
-          const clickRes: any = await new Promise((resolve) =>
-            chrome.tabs.sendMessage(
-              workerTabId,
-              {
-                action: "CLICK_NEXT",
-                payload: { selector: paginationSelector },
-              },
-              resolve,
-            ),
+
+          if (clickRes?.status !== "success") {
+            console.log(
+              "Pagination click failed or exhausted.",
+              clickRes.message,
+            )
+            break
+          }
+          await randomSleep(
+            navMode === "loadMore" ? 3000 : 4000,
+            navMode === "loadMore" ? 5000 : 6000,
           )
-          if (clickRes?.status !== "success") break
-          await randomSleep(4000, 6000)
           currentPage++
-          chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
+          if (navMode === "next")
+            chrome.tabs.sendMessage(workerTabId, { action: "BLOCK_UI" })
         }
       }
 
@@ -589,7 +595,6 @@ function App() {
             currentDataState[i]["_deep_scrape_status"] = "Invalid URL"
             continue
           }
-
           setStatusText(
             `Deep Scraping Profile ${i + 1} of ${currentDataState.length}...`,
           )
@@ -598,7 +603,6 @@ function App() {
             currentDataState[i]["_deep_scrape_status"] = "Timeout"
             continue
           }
-
           const deepRes: any = await new Promise((resolve) =>
             chrome.tabs.sendMessage(
               workerTabId,
@@ -622,7 +626,6 @@ function App() {
 
       setStatusText(`Generating ${exportFormat.toUpperCase()}...`)
       if (currentDataState.length > 0) {
-        // Strip out hidden columns before export
         const cleanedData = currentDataState.map((row) => {
           const newRow = { ...row }
           const allNodes = [
@@ -630,9 +633,7 @@ function App() {
             ...(isDeepScrapeEnabled ? deepNodes : []),
           ]
           allNodes.forEach((n) => {
-            if (n.hideFromExport) {
-              delete newRow[n.columnName]
-            }
+            if (n.hideFromExport) delete newRow[n.columnName]
           })
           return newRow
         })
@@ -1158,7 +1159,6 @@ function App() {
   }
 
   const getTableHeaders = () => {
-    // Only display columns that are NOT hidden
     const surfaceHeaders = scrapedNodes
       .filter((n) => !n.hideFromExport)
       .map((n) => n.columnName)
@@ -1170,9 +1170,9 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
-      {/* Settings Panel */}
+      {/* Settings, Recipes, and Header stay the same */}
       {showSettings && (
-        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
+        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
             <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
               <Settings className="w-4 h-4" /> Global Settings
@@ -1208,9 +1208,8 @@ function App() {
         </div>
       )}
 
-      {/* Recipe Manager Panel */}
       {showRecipeManager && (
-        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
+        <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
             <h2 className="text-sm font-semibold text-primary flex items-center gap-2">
               <Bookmark className="w-4 h-4" /> Saved Recipes
@@ -1218,19 +1217,18 @@ function App() {
             <Button
               variant="ghost"
               size="icon"
-              className="w-6 h-6 hover:bg-secondary/50"
+              className="w-6 h-6"
               onClick={() => setShowRecipeManager(false)}
             >
               <X className="w-4 h-4" />
             </Button>
           </header>
-
           <div className="px-4 py-3 border-b border-border/30 bg-secondary/5 flex gap-2">
             <Button
               onClick={exportAllRecipes}
               variant="outline"
               size="sm"
-              className="flex-1 text-xs h-8 border-border/50"
+              className="flex-1 text-xs h-8"
             >
               <Download className="w-3.5 h-3.5 mr-2" /> Export Backup
             </Button>
@@ -1238,7 +1236,7 @@ function App() {
               onClick={() => fileInputRef.current?.click()}
               variant="outline"
               size="sm"
-              className="flex-1 text-xs h-8 border-border/50"
+              className="flex-1 text-xs h-8"
             >
               <Upload className="w-3.5 h-3.5 mr-2" /> Import JSON
             </Button>
@@ -1250,13 +1248,7 @@ function App() {
               onChange={importRecipes}
             />
           </div>
-
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {Object.keys(recipes).length === 0 && (
-              <p className="text-xs text-muted-foreground text-center mt-10">
-                No recipes saved yet.
-              </p>
-            )}
             {Object.entries(recipes).map(([domain, domainRecipes]) => (
               <div key={domain} className="space-y-2">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
@@ -1268,9 +1260,7 @@ function App() {
                     className="flex items-center justify-between p-3 bg-secondary/10 border border-border/30 rounded-lg group"
                   >
                     <div>
-                      <p className="text-xs font-medium text-foreground">
-                        {recipe.name}
-                      </p>
+                      <p className="text-xs font-medium">{recipe.name}</p>
                       <p className="text-[10px] text-muted-foreground">
                         {recipe.schema.length} cols • {recipe.navMode}
                       </p>
@@ -1280,7 +1270,7 @@ function App() {
                         size="sm"
                         variant="ghost"
                         onClick={() => deleteRecipe(domain, recipe.id)}
-                        className="h-7 text-xs text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="h-7 text-xs text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100"
                       >
                         Delete
                       </Button>
@@ -1331,7 +1321,7 @@ function App() {
             {(scrapedNodes.length > 0 ||
               deepNodes.length > 0 ||
               containerSelector ||
-              paginationSelector) && (
+              paginationSelectors) && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -1365,9 +1355,7 @@ function App() {
             {liveData.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-muted-foreground space-y-3 opacity-50">
                 <Activity className="w-8 h-8 animate-pulse" />
-                <p className="text-xs font-medium">
-                  Awaiting first payload from worker...
-                </p>
+                <p className="text-xs font-medium">Awaiting payload...</p>
               </div>
             ) : (
               <div className="border border-border/40 rounded-lg overflow-hidden bg-background shadow-sm">
@@ -1381,7 +1369,7 @@ function App() {
                         {getTableHeaders().map((h, i) => (
                           <th
                             key={i}
-                            className="px-3 py-2 font-medium text-muted-foreground border-r border-border/20 last:border-0"
+                            className="px-3 py-2 font-medium text-muted-foreground border-r border-border/20"
                           >
                             {h}
                           </th>
@@ -1392,7 +1380,7 @@ function App() {
                       {liveData.map((row, idx) => (
                         <tr
                           key={idx}
-                          className="border-b border-border/20 last:border-0 hover:bg-secondary/10 transition-colors"
+                          className="border-b border-border/20 hover:bg-secondary/10"
                         >
                           <td className="px-3 py-2 text-muted-foreground font-mono border-r border-border/20">
                             {idx + 1}
@@ -1400,14 +1388,10 @@ function App() {
                           {getTableHeaders().map((h, i) => (
                             <td
                               key={i}
-                              className="px-3 py-2 max-w-[200px] truncate border-r border-border/20 last:border-0"
+                              className="px-3 py-2 max-w-[200px] truncate border-r border-border/20"
                               title={row[h]}
                             >
-                              {row[h] || (
-                                <span className="text-muted-foreground/30">
-                                  -
-                                </span>
-                              )}
+                              {row[h] || "-"}
                             </td>
                           ))}
                         </tr>
@@ -1433,7 +1417,7 @@ function App() {
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="h-6 w-6 text-primary hover:bg-primary/20"
+                  className="h-6 w-6 text-primary"
                   onClick={() => setSuggestedRecipe(null)}
                 >
                   <X className="w-3 h-3" />
@@ -1450,11 +1434,9 @@ function App() {
           )}
 
           <section className="space-y-4 pb-4 border-b border-border/40">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold tracking-wide text-foreground">
-                Surface Data (List Page)
-              </h2>
-            </div>
+            <h2 className="text-sm font-semibold tracking-wide text-foreground">
+              Surface Data (List Page)
+            </h2>
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">
                 Row Container
@@ -1599,11 +1581,9 @@ function App() {
           </section>
 
           <section className="space-y-3">
-            <div className="flex items-center justify-between text-muted-foreground">
-              <h2 className="text-sm font-semibold tracking-wide text-foreground">
-                Navigation & Pagination
-              </h2>
-            </div>
+            <h2 className="text-sm font-semibold tracking-wide text-foreground">
+              Navigation & Pagination
+            </h2>
             <div className="p-3.5 bg-secondary/10 border border-border/30 rounded-xl space-y-4">
               <div className="space-y-1.5">
                 <Label className="text-xs text-muted-foreground">Mode</Label>
@@ -1656,11 +1636,15 @@ function App() {
                     disabled={isScraping}
                     variant="outline"
                     size="sm"
-                    className={`w-full text-xs h-8 border-dashed ${paginationSelector ? "border-solid bg-background" : ""}`}
+                    className={`w-full text-xs h-8 border-dashed ${paginationSelectors ? "border-solid bg-background text-indigo-400" : ""}`}
                   >
-                    {paginationSelector
-                      ? "Target Locked"
-                      : "+ Select Button on Page"}
+                    {paginationSelectors ? (
+                      <span className="flex items-center gap-1">
+                        <Wand2 className="w-3 h-3" /> Robust Selection Locked
+                      </span>
+                    ) : (
+                      "+ Select Button on Page"
+                    )}
                   </Button>
                 </div>
               )}

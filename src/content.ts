@@ -63,6 +63,54 @@ const getExactSelector = (el: HTMLElement): string => {
   return path.join(" > ")
 }
 
+// ROBUST PAGINATION SELECTOR ENGINE
+const getRobustPaginationSelectors = (clickedEl: HTMLElement): string[] => {
+  const selectors: string[] = []
+
+  // Climb the tree slightly in case the user clicked an inner <span> or <svg> inside the button
+  let targetEl = clickedEl
+  const interactiveParent = clickedEl.closest(
+    'button, a, [role="button"]',
+  ) as HTMLElement
+  if (interactiveParent) targetEl = interactiveParent
+
+  // 1. Semantic Attributes (Highest Reliability)
+  const ariaLabel = targetEl.getAttribute("aria-label")
+  if (ariaLabel && ariaLabel.toLowerCase().includes("next")) {
+    selectors.push(
+      `${targetEl.tagName.toLowerCase()}[aria-label="${ariaLabel}"]`,
+    )
+  }
+  if (targetEl instanceof HTMLAnchorElement && targetEl.rel === "next") {
+    selectors.push(`a[rel="next"]`)
+  }
+
+  // 2. Class names containing 'next'
+  if (targetEl.className && typeof targetEl.className === "string") {
+    const classes = targetEl.className.split(" ")
+    const nextClass = classes.find((c) => c.toLowerCase().includes("next"))
+    if (nextClass) selectors.push(`.${nextClass}`)
+  }
+
+  // 3. Text content (XPath generation)
+  const textContent = targetEl.innerText.trim().toLowerCase()
+  if (["next", "next page", ">", "→"].includes(textContent)) {
+    // Prefix with xpath= so our executor knows how to handle it
+    selectors.push(
+      `xpath=//${targetEl.tagName.toLowerCase()}[normalize-space(text())='${targetEl.innerText.trim()}']`,
+    )
+  }
+
+  // 4. Exact DOM Path (Brittle but acts as a solid fallback)
+  selectors.push(getExactSelector(targetEl))
+
+  // 5. Generic class/tag path
+  selectors.push(generateSelector(targetEl))
+
+  // Remove exact duplicates
+  return Array.from(new Set(selectors))
+}
+
 const extractAvailableAttributes = (el: HTMLElement) => {
   const attrs: { name: string; preview: string }[] = []
   attrs.push({
@@ -81,7 +129,6 @@ const extractAvailableAttributes = (el: HTMLElement) => {
   return attrs
 }
 
-// Automatically detect robust attribute selectors for elements like emails or phones
 const detectSmartSelector = (el: HTMLElement): string | undefined => {
   if (el instanceof HTMLAnchorElement) {
     if (el.href.startsWith("mailto:")) return `a[href^="mailto:"]`
@@ -140,8 +187,8 @@ const handleClick = (e: MouseEvent) => {
       const exactSelector = getExactSelector(hoveredElement)
       const smartSelector = detectSmartSelector(hoveredElement)
 
-      let patternMatches = 0
-      let exactMatches = 0
+      let patternMatches = 0,
+        exactMatches = 0
       try {
         patternMatches = document.querySelectorAll(patternSelector).length
       } catch (e) {}
@@ -160,6 +207,13 @@ const handleClick = (e: MouseEvent) => {
           attributes: extractAvailableAttributes(hoveredElement),
         },
       })
+    } else if (currentSelectionMode === "pagination") {
+      // Use the new Robust Engine
+      const selectors = getRobustPaginationSelectors(hoveredElement)
+      chrome.runtime.sendMessage({
+        action: "PAGINATION_SELECTED",
+        payload: { selectors },
+      })
     } else {
       const selector = generateSelector(hoveredElement)
       if (currentSelectionMode === "clickAction") {
@@ -175,11 +229,6 @@ const handleClick = (e: MouseEvent) => {
         chrome.runtime.sendMessage({
           action: "CONTAINER_SELECTED",
           payload: { selector, count },
-        })
-      } else if (currentSelectionMode === "pagination") {
-        chrome.runtime.sendMessage({
-          action: "PAGINATION_SELECTED",
-          payload: { selector },
         })
       }
     }
@@ -220,17 +269,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "SYNC_HIGHLIGHTS") {
     clearAllHighlights()
-    const { schema, containerSelector, paginationSelector } = request.payload
+    const { schema, containerSelector, paginationSelectors } = request.payload
 
     try {
       if (containerSelector)
         document
           .querySelectorAll(containerSelector)
           .forEach((el) => el.classList.add("web-scrapy-container-selected"))
-      if (paginationSelector) {
-        const el = document.querySelector(paginationSelector)
-        if (el) el.classList.add("web-scrapy-pagination-selected")
+
+      // Highlight the first valid pagination selector found
+      if (paginationSelectors && Array.isArray(paginationSelectors)) {
+        for (const sel of paginationSelectors) {
+          try {
+            let el: HTMLElement | null = null
+            if (sel.startsWith("xpath=")) {
+              const result = document.evaluate(
+                sel.replace("xpath=", ""),
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null,
+              )
+              el = result.singleNodeValue as HTMLElement
+            } else {
+              el = document.querySelector(sel)
+            }
+            if (el) {
+              el.classList.add("web-scrapy-pagination-selected")
+              break // Only highlight one
+            }
+          } catch (e) {}
+        }
       }
+
       schema.forEach((col: any) => {
         let activeSel = col.selector
         if (col.targetingStrategy === "strict") activeSel = col.exactSelector
@@ -278,7 +349,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true
   }
 
-  // --- CORE EXTRACTION ENGINE ---
   if (request.action === "EXECUTE_SCRAPE") {
     ;(async () => {
       try {
@@ -302,24 +372,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           if (val && col.regexPreset && col.regexPreset !== "none") {
             let match = null
-            if (col.regexPreset === "email") {
+            if (col.regexPreset === "email")
               match = val.match(
                 /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
               )
-            } else if (col.regexPreset === "phone") {
+            else if (col.regexPreset === "phone")
               match = val.match(
                 /(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/,
               )
-            } else if (col.regexPreset === "url") {
+            else if (col.regexPreset === "url")
               match = val.match(/https?:\/\/[^\s]+/)
-            } else if (col.regexPreset === "linkedin") {
+            else if (col.regexPreset === "linkedin")
               match = val.match(/(https?:\/\/)?(www\.)?linkedin\.com\/[^\s]+/i)
-            } else if (col.regexPreset === "custom" && col.customRegexPattern) {
+            else if (col.regexPreset === "custom" && col.customRegexPattern) {
               try {
                 match = val.match(new RegExp(col.customRegexPattern, "i"))
-              } catch (e) {
-                console.error("Invalid custom regex", e)
-              }
+              } catch (e) {}
             }
             val = match ? match[0] : ""
           }
@@ -330,9 +398,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           container: ParentNode,
           col: any,
         ): HTMLElement | null => {
-          if (col.targetingStrategy === "smart" && col.smartSelector) {
+          if (col.targetingStrategy === "smart" && col.smartSelector)
             return container.querySelector(col.smartSelector) as HTMLElement
-          }
           if (col.targetingStrategy === "label" && col.anchorLabelText) {
             try {
               const xpath = `descendant-or-self::*[contains(text(), '${col.anchorLabelText}')]`
@@ -346,18 +413,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               const labelNode = result.singleNodeValue as HTMLElement
 
               if (labelNode) {
-                if (labelNode.nextElementSibling) {
+                if (labelNode.nextElementSibling)
                   return labelNode.nextElementSibling as HTMLElement
-                }
-                if (labelNode.parentElement?.nextElementSibling) {
+                if (labelNode.parentElement?.nextElementSibling)
                   return labelNode.parentElement
                     .nextElementSibling as HTMLElement
-                }
                 return labelNode
               }
-            } catch (e) {
-              console.warn("XPath label evaluation failed", e)
-            }
+            } catch (e) {}
             return null
           }
           const targetSel =
@@ -367,14 +430,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return container.querySelector(targetSel) as HTMLElement
         }
 
-        // --- Container Mode Execution ---
         if (containerSelector) {
           const containers = Array.from(
             document.querySelectorAll(containerSelector),
           )
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
-
             for (const col of schema) {
               if (col.actions && col.actions.length > 0) {
                 for (const action of col.actions) {
@@ -410,23 +471,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               rowObj[col.columnName] = extractElementValue(el, col)
             }
 
-            // Process Fallbacks
             for (const col of schema) {
               if (!rowObj[col.columnName] && col.fallbackColumnId) {
                 const fallbackCol = schema.find(
                   (c: any) => c.id === col.fallbackColumnId,
                 )
-                if (fallbackCol && rowObj[fallbackCol.columnName]) {
+                if (fallbackCol && rowObj[fallbackCol.columnName])
                   rowObj[col.columnName] = rowObj[fallbackCol.columnName]
-                }
               }
             }
             scrapedData.push(rowObj)
           }
-        }
-
-        // --- Full Page Mode Execution ---
-        else {
+        } else {
           for (const col of schema) {
             if (col.actions && col.actions.length > 0) {
               for (const action of col.actions) {
@@ -505,18 +561,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               rowObj[col.columnName] = extractElementValue(el || null, col)
             })
 
-            // Process Fallbacks
             columnData.forEach((col: any) => {
               if (!rowObj[col.columnName] && col.fallbackColumnId) {
                 const fallbackCol = columnData.find(
                   (c: any) => c.id === col.fallbackColumnId,
                 )
-                if (fallbackCol && rowObj[fallbackCol.columnName]) {
+                if (fallbackCol && rowObj[fallbackCol.columnName])
                   rowObj[col.columnName] = rowObj[fallbackCol.columnName]
-                }
               }
             })
-
             scrapedData.push(rowObj)
           }
         }
@@ -528,23 +581,66 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true
   }
 
+  // UPDATED: MULTI-STRATEGY EXECUTION
   if (request.action === "CLICK_NEXT") {
-    const nextBtn = document.querySelector(request.payload.selector) as
-      | HTMLElement
-      | HTMLButtonElement
-    if (nextBtn) {
+    const selectors = request.payload.selectors as string[]
+    let targetBtn: HTMLElement | null = null
+
+    if (!selectors || selectors.length === 0) {
+      sendResponse({ status: "error", message: "No selectors provided" })
+      return true
+    }
+
+    // Try each strategy in order until we find a button on the screen
+    for (const sel of selectors) {
+      try {
+        if (sel.startsWith("xpath=")) {
+          const x = sel.replace("xpath=", "")
+          const result = document.evaluate(
+            x,
+            document,
+            null,
+            XPathResult.FIRST_ORDERED_NODE_TYPE,
+            null,
+          )
+          if (result.singleNodeValue) {
+            targetBtn = result.singleNodeValue as HTMLElement
+            break
+          }
+        } else {
+          const el = document.querySelector(sel) as HTMLElement
+          if (el) {
+            targetBtn = el
+            break
+          }
+        }
+      } catch (e) {
+        console.warn("Strategy failed:", sel)
+      }
+    }
+
+    if (targetBtn) {
+      // Robust check for standard disablement
       const isDisabled =
-        (nextBtn as HTMLButtonElement).disabled ||
-        nextBtn.classList.contains("disabled") ||
-        nextBtn.getAttribute("aria-disabled") === "true"
-      if (isDisabled)
-        sendResponse({ status: "error", message: "Next button disabled" })
-      else {
-        nextBtn.click()
+        (targetBtn as HTMLButtonElement).disabled ||
+        targetBtn.classList.contains("disabled") ||
+        targetBtn.getAttribute("aria-disabled") === "true" ||
+        targetBtn.parentElement?.classList.contains("disabled")
+
+      if (isDisabled) {
+        sendResponse({
+          status: "error",
+          message: "Next button is present but disabled",
+        })
+      } else {
+        targetBtn.click()
         sendResponse({ status: "success" })
       }
     } else {
-      sendResponse({ status: "error", message: "Not found" })
+      sendResponse({
+        status: "error",
+        message: "Next button not found using any strategy",
+      })
     }
   }
   return true
