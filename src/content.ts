@@ -81,6 +81,20 @@ const extractAvailableAttributes = (el: HTMLElement) => {
   return attrs
 }
 
+// Automatically detect robust attribute selectors for elements like emails or phones
+const detectSmartSelector = (el: HTMLElement): string | undefined => {
+  if (el instanceof HTMLAnchorElement) {
+    if (el.href.startsWith("mailto:")) return `a[href^="mailto:"]`
+    if (el.href.startsWith("tel:")) return `a[href^="tel:"]`
+    if (el.href.includes("linkedin.com")) return `a[href*="linkedin.com"]`
+    if (el.href.includes("twitter.com") || el.href.includes("x.com"))
+      return `a[href*="twitter.com"], a[href*="x.com"]`
+    if (el.href.includes("facebook.com")) return `a[href*="facebook.com"]`
+    if (el.href.includes("instagram.com")) return `a[href*="instagram.com"]`
+  }
+  return undefined
+}
+
 const handleMouseMove = (e: MouseEvent) => {
   if (!isSelecting) return
   const target = e.target as HTMLElement
@@ -124,6 +138,7 @@ const handleClick = (e: MouseEvent) => {
     if (currentSelectionMode === "column") {
       const patternSelector = generateSelector(hoveredElement)
       const exactSelector = getExactSelector(hoveredElement)
+      const smartSelector = detectSmartSelector(hoveredElement)
 
       let patternMatches = 0
       let exactMatches = 0
@@ -134,12 +149,12 @@ const handleClick = (e: MouseEvent) => {
         exactMatches = document.querySelectorAll(exactSelector).length
       } catch (e) {}
 
-      // Notice we do NOT apply highlights here anymore. React will handle it via SYNC_HIGHLIGHTS.
       chrome.runtime.sendMessage({
         action: "ELEMENTS_SELECTED",
         payload: {
           patternSelector,
           exactSelector,
+          smartSelector,
           patternCount: patternMatches,
           exactCount: exactMatches,
           attributes: extractAvailableAttributes(hoveredElement),
@@ -203,9 +218,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ status: "success" })
   }
 
-  // --- NEW: THE SYNC ENGINE ---
   if (request.action === "SYNC_HIGHLIGHTS") {
-    clearAllHighlights() // Wipe the slate clean
+    clearAllHighlights()
     const { schema, containerSelector, paginationSelector } = request.payload
 
     try {
@@ -218,10 +232,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (el) el.classList.add("web-scrapy-pagination-selected")
       }
       schema.forEach((col: any) => {
-        if (col.selector)
+        // Find the active selector based on the targeting strategy
+        let activeSel = col.selector
+        if (col.targetingStrategy === "strict") activeSel = col.exactSelector
+        if (col.targetingStrategy === "smart" && col.smartSelector)
+          activeSel = col.smartSelector
+
+        if (activeSel && col.targetingStrategy !== "label") {
           document
-            .querySelectorAll(col.selector)
+            .querySelectorAll(activeSel)
             .forEach((el) => el.classList.add("web-scrapy-selected"))
+        }
+
         if (col.actions) {
           col.actions.forEach((act: any) => {
             if (act.selector)
@@ -237,7 +259,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ status: "success" })
   }
 
-  // UI Blockers & Executions remain unchanged
   if (request.action === "BLOCK_UI") {
     if (!document.getElementById("web-scrapy-glass-shield")) {
       const shield = document.createElement("div")
@@ -258,6 +279,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true
   }
 
+  // --- CORE EXTRACTION ENGINE ---
   if (request.action === "EXECUTE_SCRAPE") {
     ;(async () => {
       try {
@@ -265,12 +287,105 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const containerSelector = request.payload.containerSelector
         const scrapedData: any[] = []
 
+        // Helper to extract a single element's data based on column settings
+        const extractElementValue = (
+          el: HTMLElement | null,
+          col: any,
+        ): string => {
+          let val = ""
+          if (el) {
+            if (col.attribute === "text") val = el.innerText.trim()
+            else if (col.attribute === "href")
+              val = (el as HTMLAnchorElement).href || ""
+            else if (col.attribute === "src")
+              val = (el as HTMLImageElement).src || ""
+            else val = el.getAttribute(col.attribute) || ""
+          }
+
+          // Apply Post-Processing Regex Formatter
+          if (val && col.regexPreset && col.regexPreset !== "none") {
+            let match = null
+            if (col.regexPreset === "email") {
+              match = val.match(
+                /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
+              )
+            } else if (col.regexPreset === "phone") {
+              // Standard robust phone matcher
+              match = val.match(
+                /(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/,
+              )
+            } else if (col.regexPreset === "url") {
+              match = val.match(/https?:\/\/[^\s]+/)
+            } else if (col.regexPreset === "linkedin") {
+              match = val.match(/(https?:\/\/)?(www\.)?linkedin\.com\/[^\s]+/i)
+            } else if (col.regexPreset === "custom" && col.customRegexPattern) {
+              try {
+                match = val.match(new RegExp(col.customRegexPattern, "i"))
+              } catch (e) {
+                console.error("Invalid custom regex", e)
+              }
+            }
+            val = match ? match[0] : ""
+          }
+          return val
+        }
+
+        // Helper to locate an element relative to a parent container
+        const locateElement = (
+          container: ParentNode,
+          col: any,
+        ): HTMLElement | null => {
+          if (col.targetingStrategy === "smart" && col.smartSelector) {
+            return container.querySelector(col.smartSelector) as HTMLElement
+          }
+          if (col.targetingStrategy === "label" && col.anchorLabelText) {
+            try {
+              // Create an XPath to find the element containing the exact text inside this container
+              const xpath = `descendant-or-self::*[contains(text(), '${col.anchorLabelText}')]`
+              const result = document.evaluate(
+                xpath,
+                container,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null,
+              )
+              const labelNode = result.singleNodeValue as HTMLElement
+
+              if (labelNode) {
+                // Try grabbing the next sibling first
+                if (labelNode.nextElementSibling) {
+                  return labelNode.nextElementSibling as HTMLElement
+                }
+                // If it's isolated in a span/div, grab the parent's next sibling
+                if (labelNode.parentElement?.nextElementSibling) {
+                  return labelNode.parentElement
+                    .nextElementSibling as HTMLElement
+                }
+                // Fallback: return the label node itself, hoping regex can parse the text out of it
+                return labelNode
+              }
+            } catch (e) {
+              console.warn("XPath label evaluation failed", e)
+            }
+            return null
+          }
+          // Default: Pattern or Strict Path
+          const targetSel =
+            col.targetingStrategy === "strict"
+              ? col.exactSelector
+              : col.patternSelector
+          return container.querySelector(targetSel) as HTMLElement
+        }
+
+        // --- Container Mode Execution ---
         if (containerSelector) {
           const containers = Array.from(
             document.querySelectorAll(containerSelector),
           )
           for (const container of containers) {
             const rowObj: Record<string, string> = {}
+
+            // Execute Pre-Scrape Actions
             for (const col of schema) {
               if (col.actions && col.actions.length > 0) {
                 for (const action of col.actions) {
@@ -300,22 +415,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 }
               }
             }
+
+            // Extract Data
             for (const col of schema) {
-              const el = container.querySelector(col.selector) as HTMLElement
-              let val = ""
-              if (el) {
-                if (col.attribute === "text") val = el.innerText.trim()
-                else if (col.attribute === "href")
-                  val = (el as HTMLAnchorElement).href || ""
-                else if (col.attribute === "src")
-                  val = (el as HTMLImageElement).src || ""
-                else val = el.getAttribute(col.attribute) || ""
-              }
-              rowObj[col.columnName] = val
+              const el = locateElement(container, col)
+              rowObj[col.columnName] = extractElementValue(el, col)
             }
             scrapedData.push(rowObj)
           }
-        } else {
+        }
+
+        // --- Full Page Mode Execution ---
+        else {
           for (const col of schema) {
             if (col.actions && col.actions.length > 0) {
               for (const action of col.actions) {
@@ -345,7 +456,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           let maxRows = 0
           const columnData = schema.map((col: any) => {
-            const elements = Array.from(document.querySelectorAll(col.selector))
+            let elements: HTMLElement[] = []
+
+            if (col.targetingStrategy === "smart" && col.smartSelector) {
+              elements = Array.from(
+                document.querySelectorAll(col.smartSelector),
+              ) as HTMLElement[]
+            } else if (
+              col.targetingStrategy === "label" &&
+              col.anchorLabelText
+            ) {
+              // Advanced Label finding across whole document
+              const xpath = `//*[contains(text(), '${col.anchorLabelText}')]`
+              const result = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+                null,
+              )
+              for (let i = 0; i < result.snapshotLength; i++) {
+                const labelNode = result.snapshotItem(i) as HTMLElement
+                if (labelNode.nextElementSibling)
+                  elements.push(labelNode.nextElementSibling as HTMLElement)
+                else if (labelNode.parentElement?.nextElementSibling)
+                  elements.push(
+                    labelNode.parentElement.nextElementSibling as HTMLElement,
+                  )
+                else elements.push(labelNode)
+              }
+            } else {
+              const targetSel =
+                col.targetingStrategy === "strict"
+                  ? col.exactSelector
+                  : col.patternSelector
+              elements = Array.from(
+                document.querySelectorAll(targetSel),
+              ) as HTMLElement[]
+            }
+
             maxRows = Math.max(maxRows, elements.length)
             return { ...col, elements }
           })
@@ -353,17 +502,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           for (let i = 0; i < maxRows; i++) {
             const rowObj: Record<string, string> = {}
             columnData.forEach((col: any) => {
-              const el = col.elements[i] as HTMLElement
-              let val = ""
-              if (el) {
-                if (col.attribute === "text") val = el.innerText.trim()
-                else if (col.attribute === "href")
-                  val = (el as HTMLAnchorElement).href || ""
-                else if (col.attribute === "src")
-                  val = (el as HTMLImageElement).src || ""
-                else val = el.getAttribute(col.attribute) || ""
-              }
-              rowObj[col.columnName] = val
+              const el = col.elements[i] as HTMLElement | undefined
+              rowObj[col.columnName] = extractElementValue(el || null, col)
             })
             scrapedData.push(rowObj)
           }

@@ -9,6 +9,7 @@ import {
   Clock,
   Download,
   ExternalLink,
+  Filter,
   Keyboard,
   Layers,
   Link2,
@@ -19,8 +20,10 @@ import {
   Settings,
   Square,
   TableProperties,
+  Target,
   Trash2,
   Upload,
+  Wand2,
   X,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
@@ -51,9 +54,19 @@ interface ScrapedNode {
   patternCount: number
   exactCount: number
   isExact: boolean
+
+  // Advanced Targeting
+  smartSelector?: string
+  targetingStrategy: "pattern" | "strict" | "smart" | "label"
+  anchorLabelText?: string
+
+  // Extraction & Post-Processing
   columnName: string
   attribute: string
   availableAttributes: { name: string; preview: string }[]
+  regexPreset: "none" | "email" | "phone" | "url" | "linkedin" | "custom"
+  customRegexPattern?: string
+
   actions?: ScrapeAction[]
 }
 
@@ -184,6 +197,7 @@ function App() {
     const handleMessage = (message: any) => {
       if (message.action === "ELEMENTS_SELECTED") {
         setIsSelecting(false)
+        const hasSmartSelector = !!message.payload.smartSelector
         const newNode: ScrapedNode = {
           id: crypto.randomUUID(),
           selector: message.payload.patternSelector,
@@ -193,6 +207,11 @@ function App() {
           patternCount: message.payload.patternCount,
           exactCount: message.payload.exactCount,
           isExact: false,
+
+          smartSelector: message.payload.smartSelector,
+          targetingStrategy: hasSmartSelector ? "smart" : "pattern",
+          regexPreset: "none",
+
           columnName: `Column ${Date.now().toString().slice(-4)}`,
           attribute: "text",
           availableAttributes: message.payload.attributes,
@@ -244,10 +263,9 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(handleMessage)
   }, [])
 
-  // --- NEW: REACT-DRIVEN DOM SYNCHRONIZATION ---
   useEffect(() => {
     const syncHighlights = async () => {
-      if (isScraping) return // Freeze visual updates during active run
+      if (isScraping) return
       try {
         const [tab] = await chrome.tabs.query({
           active: true,
@@ -262,9 +280,7 @@ function App() {
             paginationSelector,
           },
         })
-      } catch (error) {
-        /* Ignore if content script disconnected */
-      }
+      } catch (error) {}
     }
     syncHighlights()
   }, [
@@ -649,6 +665,7 @@ function App() {
       ),
     )
   }
+
   const updateAction = (
     nodeId: string,
     actionId: string,
@@ -670,6 +687,7 @@ function App() {
       ),
     )
   }
+
   const removeAction = (
     nodeId: string,
     actionId: string,
@@ -695,11 +713,12 @@ function App() {
     const setNodes = target === "surface" ? setScrapedNodes : setDeepNodes
     const isNodeActionSelecting =
       isSelecting && activeActionTargetRef.current?.colId === node.id
+    const isRegexCustom = node.regexPreset === "custom"
 
     return (
       <div
         key={node.id}
-        className="p-3.5 bg-secondary/10 rounded-xl border border-border/30 group"
+        className="p-3.5 bg-secondary/10 rounded-xl border border-border/30 group transition-all"
       >
         <div className="flex items-start justify-between mb-3">
           <div className="flex-1 space-y-1">
@@ -719,35 +738,11 @@ function App() {
               <p className="text-[10px] text-muted-foreground font-mono">
                 {node.count} matches
               </p>
-              <div className="flex items-center gap-1 opacity-60 hover:opacity-100 transition-opacity">
-                <input
-                  type="checkbox"
-                  checked={node.isExact || false}
-                  onChange={(e) => {
-                    const exact = e.target.checked
-                    setNodes((prev) =>
-                      prev.map((n) =>
-                        n.id === node.id
-                          ? {
-                              ...n,
-                              isExact: exact,
-                              selector: exact
-                                ? n.exactSelector || n.selector
-                                : n.patternSelector || n.selector,
-                              count: exact
-                                ? n.exactCount || n.count
-                                : n.patternCount || n.count,
-                            }
-                          : n,
-                      ),
-                    )
-                  }}
-                  className="accent-primary w-2.5 h-2.5 rounded-sm"
-                />
-                <Label className="text-[9px] text-muted-foreground cursor-pointer uppercase tracking-wider">
-                  Strict Path
-                </Label>
-              </div>
+              {node.smartSelector && (
+                <span className="flex items-center gap-1 text-[9px] text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded uppercase tracking-wider font-semibold">
+                  <Wand2 className="w-2.5 h-2.5" /> Smart Link
+                </span>
+              )}
             </div>
           </div>
           <Button
@@ -763,37 +758,88 @@ function App() {
           </Button>
         </div>
 
-        <div className="flex items-center gap-2 mb-3">
-          <Label className="text-[10px] uppercase tracking-wider text-muted-foreground w-16 shrink-0">
-            Extract
-          </Label>
-          <Select
-            disabled={isScraping}
-            value={node.attribute}
-            onValueChange={(val) =>
-              setNodes((prev) =>
-                prev.map((n) =>
-                  n.id === node.id ? { ...n, attribute: val } : n,
-                ),
-              )
-            }
-          >
-            <SelectTrigger className="flex-1 h-7 text-xs bg-background border-border/50 shadow-sm capitalize rounded-md">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="border-border">
-              {node.availableAttributes.map((attr) => (
-                <SelectItem
-                  key={attr.name}
-                  value={attr.name}
-                  className="capitalize text-xs"
-                >
-                  {attr.name === "text" ? "Text (Inner)" : attr.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <div className="space-y-1.5">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Extract
+            </Label>
+            <Select
+              disabled={isScraping}
+              value={node.attribute}
+              onValueChange={(val) =>
+                setNodes((prev) =>
+                  prev.map((n) =>
+                    n.id === node.id ? { ...n, attribute: val } : n,
+                  ),
+                )
+              }
+            >
+              <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm capitalize rounded-md">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="border-border">
+                {node.availableAttributes.map((attr) => (
+                  <SelectItem
+                    key={attr.name}
+                    value={attr.name}
+                    className="capitalize text-xs"
+                  >
+                    {attr.name === "text" ? "Inner Text" : attr.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+              <Filter className="w-3 h-3" /> Format
+            </Label>
+            <Select
+              disabled={isScraping}
+              value={node.regexPreset || "none"}
+              onValueChange={(val: any) =>
+                setNodes((prev) =>
+                  prev.map((n) =>
+                    n.id === node.id ? { ...n, regexPreset: val } : n,
+                  ),
+                )
+              }
+            >
+              <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm rounded-md">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">Raw Output</SelectItem>
+                <SelectItem value="email">Email Address</SelectItem>
+                <SelectItem value="phone">Phone Number</SelectItem>
+                <SelectItem value="url">Web URL</SelectItem>
+                <SelectItem value="linkedin">LinkedIn URL</SelectItem>
+                <SelectItem value="custom">Custom Regex</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
+
+        {isRegexCustom && (
+          <div className="mb-3 animate-in fade-in slide-in-from-top-1">
+            <Input
+              disabled={isScraping}
+              placeholder="e.g., [A-Z0-9._%+-]+@[A-Z0-9.-]+"
+              value={node.customRegexPattern || ""}
+              onChange={(e) =>
+                setNodes((prev) =>
+                  prev.map((n) =>
+                    n.id === node.id
+                      ? { ...n, customRegexPattern: e.target.value }
+                      : n,
+                  ),
+                )
+              }
+              className="h-7 text-xs font-mono bg-black/20"
+            />
+          </div>
+        )}
 
         <div className="bg-black/20 rounded-md p-2 border border-border/20 mb-3">
           <p
@@ -804,7 +850,70 @@ function App() {
           </p>
         </div>
 
-        <div className="pt-2 border-t border-border/50 space-y-2">
+        <div className="pt-3 border-t border-border/50 space-y-2">
+          <div className="flex items-center justify-between mb-2">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+              <Target className="w-3 h-3" /> Targeting Strategy
+            </Label>
+          </div>
+          <Select
+            disabled={isScraping}
+            value={node.targetingStrategy || "pattern"}
+            onValueChange={(val: any) =>
+              setNodes((prev) =>
+                prev.map((n) =>
+                  n.id === node.id
+                    ? {
+                        ...n,
+                        targetingStrategy: val,
+                        selector:
+                          val === "strict"
+                            ? n.exactSelector
+                            : n.patternSelector,
+                      }
+                    : n,
+                ),
+              )
+            }
+          >
+            <SelectTrigger className="h-7 text-xs bg-background border-border/50 shadow-sm rounded-md">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="pattern">Pattern Match</SelectItem>
+              <SelectItem value="strict">Strict DOM Path</SelectItem>
+              <SelectItem value="smart" disabled={!node.smartSelector}>
+                Smart Attribute (Auto)
+              </SelectItem>
+              <SelectItem value="label">Anchor to Text Label</SelectItem>
+            </SelectContent>
+          </Select>
+
+          {node.targetingStrategy === "label" && (
+            <div className="pt-2 animate-in fade-in slide-in-from-top-1">
+              <Input
+                disabled={isScraping}
+                placeholder="Enter exact label text (e.g., 'Email:')"
+                value={node.anchorLabelText || ""}
+                onChange={(e) =>
+                  setNodes((prev) =>
+                    prev.map((n) =>
+                      n.id === node.id
+                        ? { ...n, anchorLabelText: e.target.value }
+                        : n,
+                    ),
+                  )
+                }
+                className="h-7 text-xs bg-black/20 border-indigo-500/30 focus-visible:border-indigo-500"
+              />
+              <p className="text-[9px] text-muted-foreground mt-1">
+                Extracts the value immediately following this text.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="pt-3 mt-3 border-t border-border/50 space-y-2">
           <div className="flex items-center justify-between">
             <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
               Pre-Scrape Actions
@@ -973,6 +1082,7 @@ function App() {
 
   return (
     <div className="flex flex-col h-screen bg-background text-foreground font-sans selection:bg-primary/20">
+      {/* Settings, Recipe Manager, Header, Loading States remain unchanged */}
       {showSettings && (
         <div className="absolute inset-0 z-50 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 flex flex-col">
           <header className="flex items-center justify-between px-4 py-3 border-b border-border/40">
